@@ -19,9 +19,15 @@ add_library(NukeImGui SHARED
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_demo.cpp   # ImGui::ShowDemoWindow (validation/reference)
+    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp   # multi-viewport PLATFORM backend (native OS windows)
     imguizmo/ImGuizmo.cpp   # transform gizmo (compiled against OUR imgui, shares the context)
     src/nukeui.cpp          # the bridge: ImGui <-> iRender neutral seam
 )
+
+# GLFW (vcpkg, DYNAMIC -- the same glfw3.dll the renderer loads, so both modules share
+# ONE GLFW instance: the renderer's event polling pumps the UI's secondary windows).
+target_link_directories(NukeImGui PRIVATE "${VCPKG_INSTALLED}/$<$<CONFIG:Debug>:debug/>lib")
+target_link_libraries(NukeImGui PRIVATE glfw3dll)
 
 # Export the ImGui API from this DLL; consumers import it. One shared binary ->
 # one ImGui context across the editor, the render module and plugins.
