@@ -63,17 +63,28 @@ void UpdateTextures(ImDrawData* dd)
 		{
 			case ImTextureStatus_WantCreate:
 			{
+				// GPU resource creation can fail TRANSIENTLY (upload-heap pressure at boot —
+				// e.g. dotnet compiling game scripts in parallel). Never store a null id with
+				// status OK (release builds would draw with a null texture view -> access
+				// violation); keep WantCreate and retry next frame — draw cmds referencing the
+				// texture are skipped by BuildDrawData until it exists.
 				uint64_t h = g_render->createTexture2D(tex->GetPixels(), tex->Width, tex->Height);
+				if (!h)
+					break;
 				tex->SetTexID((ImTextureID)h);
 				tex->SetStatus(ImTextureStatus_OK);
 				break;
 			}
 			case ImTextureStatus_WantUpdates:
 			{
-				// The neutral seam has no partial update: recreate the whole texture.
+				// The neutral seam has no partial update: recreate the whole texture. Create
+				// the replacement FIRST — if that fails, keep the stale texture alive and retry
+				// next frame (a one-frame-old atlas beats a null texture in the draw list).
+				uint64_t h = g_render->createTexture2D(tex->GetPixels(), tex->Width, tex->Height);
+				if (!h)
+					break;
 				if (tex->GetTexID() != ImTextureID_Invalid)
 					g_render->destroyTexture2D((uint64_t)tex->GetTexID());
-				uint64_t h = g_render->createTexture2D(tex->GetPixels(), tex->Width, tex->Height);
 				tex->SetTexID((ImTextureID)h);
 				tex->SetStatus(ImTextureStatus_OK);
 				break;
@@ -117,12 +128,20 @@ void BuildDrawData(ImDrawData* dd, std::vector<NukeUIDrawList>& lists,
 			const ImDrawCmd& dc = dl->CmdBuffer[c];
 			if (dc.UserCallback != nullptr || dc.ElemCount == 0)
 				continue;
+			// Read the tex id WITHOUT ImDrawCmd::GetTexID(): its IM_ASSERT aborts the whole
+			// app on a texture that failed to upload this frame, and release builds would
+			// pass the null straight to the GPU. A cmd whose texture isn't ready yet is
+			// SKIPPED — UpdateTextures retries the upload next frame.
+			const ImTextureData* texData = dc.TexRef._TexData;
+			const ImTextureID    texId   = texData ? texData->TexID : dc.TexRef._TexID;
+			if (texId == ImTextureID_Invalid)
+				continue;
 			NukeUICmd nc{};
 			nc.clipRect[0] = (dc.ClipRect.x - pos.x) * scale.x;
 			nc.clipRect[1] = (dc.ClipRect.y - pos.y) * scale.y;
 			nc.clipRect[2] = (dc.ClipRect.z - pos.x) * scale.x;
 			nc.clipRect[3] = (dc.ClipRect.w - pos.y) * scale.y;
-			nc.texId     = (uint64_t)dc.GetTexID();
+			nc.texId     = (uint64_t)texId;
 			nc.elemCount = dc.ElemCount;
 			nc.idxOffset = dc.IdxOffset;
 			nc.vtxOffset = dc.VtxOffset;
