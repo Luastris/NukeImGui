@@ -1,10 +1,13 @@
 #include "nukeui.h"
 #include "imgui.h"
+#include "imgui_internal.h"   // MovingWindow/ClearActiveID — host drag-to-dock (task #135)
 #include "IconsLucide.h"      // ICON_LC_* + ICON_MIN_LC / ICON_MAX_LC range
+#include <string>
 #include "backends/imgui_impl_glfw.h"   // multi-viewport PLATFORM backend (native OS windows)
 #include <render/irender.h>   // engine: iRender + NukeUIDrawData (neutral seam)
 #include <vector>
 #include <chrono>
+#include <map>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -189,11 +192,16 @@ void NukeUI::AddDrawCallback(const std::function<void()>& cb)
 	g_callbacks.push_back(cb);
 }
 
+static void TickHosts();      // editor-owned host windows (defined below)
+static void DocFrameBegin();  // detachable document windows: frame stamp (defined below)
+static void CollectDocs();    // ...and end-of-frame garbage collection
+
 void NukeUI::Frame()
 {
 	if (!g_render)
 		return;
 
+	DocFrameBegin();   // stamp the frame for the detachable-document GC
 	ImGuiIO& io = ImGui::GetIO();
 	if (g_glfwPlatform)
 	{
@@ -258,6 +266,9 @@ void NukeUI::Frame()
 			g_render->uiViewportRender(v->PlatformHandleRaw, vw, vh, vd);
 		}
 	}
+
+	TickHosts();     // editor-owned host windows (detached asset editors) — after the main pass
+	CollectDocs();   // documents not drawn this frame are closed — free their hosts
 }
 
 // GLFW key code -> ImGuiKey (modifier state comes from the mods bitmask instead).
@@ -296,6 +307,608 @@ static ImGuiKey GlfwToImGuiKey(int key)
 	return ImGuiKey_None;
 }
 
+
+// ==== EDITOR-OWNED HOST WINDOWS (Godot model, task #133) =======================================
+// A host = a decorated GLFW window WE create + an ImGui context of its own (shared font
+// atlas, style copied from the main context). Input is routed by our GLFW callbacks into
+// that context; rendering goes through the same iRender seam (uiViewportRender), so the
+// renderer's per-HWND swap-chain path is reused — but the window's lifecycle and resize
+// timing are OURS: no imgui platform-window churn, no surprise destroy/recreate.
+struct NukeUIHost
+{
+	GLFWwindow*           win = nullptr;
+	ImGuiContext*         ctx = nullptr;
+	std::function<void()> content;
+	std::string           title;
+	bool                  alive = true;
+	int                   contentFlags = 0;   // extra ImGuiWindowFlags for the content window
+	// Drag-to-dock state (the window follows the cursor; release over the main window = dock).
+	bool  dragging = false;
+	float hotX = 0, hotY = 0;    // grab point in client coords — stays under the cursor
+	bool  dockDrop = false;      // consumed by HostDockDrop
+	float dropX = 0, dropY = 0;  // cursor at drop, main-window client coords
+	// Borderless resize (OUR chrome): edge mask 1=L 2=R 4=T 8=B + gesture start state.
+	int   rsEdge = 0;
+	int   rsStartW = 0, rsStartH = 0, rsStartX = 0, rsStartY = 0;
+	POINT rsCur{};
+};
+static std::vector<NukeUIHost*> g_hosts;
+static bool  g_nativeViewports = false;    // Vulkan: imgui multi-viewport ON (hosts = D3D fallback)
+static bool  g_hostDragOverMain = false;   // a host is drag-following with the cursor over main
+static float g_dockTarget[4] = {};         // dock drop zone, main-window client coords (x,y,w,h)
+static bool  g_dockTargetValid = false;
+
+void NukeUI::EnableNativeViewports(bool on) { g_nativeViewports = on; }
+bool NukeUI::NativeViewportsActive()        { return g_nativeViewports; }
+
+bool NukeUI::HostDragActive() { return g_hostDragOverMain; }
+void NukeUI::SetDockTarget(float x, float y, float w, float h)
+{
+	g_dockTarget[0] = x; g_dockTarget[1] = y; g_dockTarget[2] = w; g_dockTarget[3] = h;
+	g_dockTargetValid = w > 0 && h > 0;
+}
+
+static NukeUIHost* HostOf(GLFWwindow* w) { return (NukeUIHost*)glfwGetWindowUserPointer(w); }
+
+// Every callback swaps to the host's context, feeds the event, and swaps back.
+#define NUKE_HOST_EVENT(body) \
+	NukeUIHost* h = HostOf(w); if (!h) return; \
+	ImGuiContext* prev = ImGui::GetCurrentContext(); \
+	ImGui::SetCurrentContext(h->ctx); \
+	body; \
+	ImGui::SetCurrentContext(prev);
+
+static void HostCursorPos(GLFWwindow* w, double x, double y)
+{ NUKE_HOST_EVENT(ImGui::GetIO().AddMousePosEvent((float)x, (float)y)) }
+static void HostMouseBtn(GLFWwindow* w, int button, int action, int)
+{
+	if (button < 0 || button > 2) return;
+	NUKE_HOST_EVENT(ImGui::GetIO().AddMouseButtonEvent(button, action == GLFW_PRESS))
+}
+static void HostScroll(GLFWwindow* w, double dx, double dy)
+{ NUKE_HOST_EVENT(ImGui::GetIO().AddMouseWheelEvent((float)dx, (float)dy)) }
+static void HostChar(GLFWwindow* w, unsigned int c)
+{ NUKE_HOST_EVENT(ImGui::GetIO().AddInputCharacter(c)) }
+static void HostFocusCb(GLFWwindow* w, int focused)
+{ NUKE_HOST_EVENT(ImGui::GetIO().AddFocusEvent(focused != 0)) }
+static void HostKey(GLFWwindow* w, int key, int, int action, int mods)
+{
+	NukeUIHost* h = HostOf(w); if (!h) return;
+	ImGuiContext* prev = ImGui::GetCurrentContext();
+	ImGui::SetCurrentContext(h->ctx);
+	ImGuiIO& hio = ImGui::GetIO();
+	hio.AddKeyEvent(ImGuiMod_Ctrl,  (mods & GLFW_MOD_CONTROL) != 0);
+	hio.AddKeyEvent(ImGuiMod_Shift, (mods & GLFW_MOD_SHIFT) != 0);
+	hio.AddKeyEvent(ImGuiMod_Alt,   (mods & GLFW_MOD_ALT) != 0);
+	const ImGuiKey k = GlfwToImGuiKey(key);
+	if (k != ImGuiKey_None && action != GLFW_REPEAT)
+		hio.AddKeyEvent(k, action == GLFW_PRESS);
+	ImGui::SetCurrentContext(prev);
+}
+
+void* NukeUI::HostCreate(const char* title, int w, int h)
+{
+	if (!g_render) return nullptr;
+	ImGuiContext* mainCtx = ImGui::GetCurrentContext();
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	// BORDERLESS: the chrome (title bar, borders, resize edges) is drawn by imgui in the
+	// EDITOR THEME — the huge light system frame is gone. Move = drag the imgui title
+	// bar; resize = the 6px imgui-handled edges (TickHosts).
+	glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+	glfwWindowHint(GLFW_VISIBLE,   GLFW_TRUE);
+	GLFWwindow* win = glfwCreateWindow(w, h, title ? title : "NukeEngine", nullptr, nullptr);
+	if (!win) return nullptr;
+
+	NukeUIHost* host = new NukeUIHost();
+	host->win = win;
+	host->title = title ? title : "NukeEngine";
+	std::cout << "[NukeUI]\thost CREATE '" << host->title << "' (" << w << "x" << h << ")" << std::endl;
+	const ImGuiStyle mainStyle = ImGui::GetStyle();           // snapshot while MAIN is current
+	host->ctx = ImGui::CreateContext(ImGui::GetIO().Fonts);   // SHARE the font atlas
+	ImGui::SetCurrentContext(host->ctx);
+	ImGui::GetIO().IniFilename = nullptr;                     // hosts don't persist imgui layout
+	ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+	ImGui::GetStyle() = mainStyle;                            // same look as the editor
+	ImGui::SetCurrentContext(mainCtx);
+
+	glfwSetWindowUserPointer(win, host);
+	glfwSetCursorPosCallback(win, HostCursorPos);
+	glfwSetMouseButtonCallback(win, HostMouseBtn);
+	glfwSetScrollCallback(win, HostScroll);
+	glfwSetKeyCallback(win, HostKey);
+	glfwSetCharCallback(win, HostChar);
+	glfwSetWindowFocusCallback(win, HostFocusCb);
+#ifdef _WIN32
+	// Dark class background: a fresh borderless window must not flash white before the
+	// first GDI blit lands.
+	if (HWND hb = glfwGetWin32Window(win))
+	{
+		static HBRUSH darkBrush = CreateSolidBrush(RGB(15, 15, 17));
+		SetClassLongPtrW(hb, GCLP_HBRBACKGROUND, (LONG_PTR)darkBrush);
+	}
+	// Inherit the editor's window icon (title bar + taskbar).
+	if (g_mainHwnd)
+	{
+		HWND src = (HWND)g_mainHwnd, dst = glfwGetWin32Window(win);
+		HICON big = (HICON)SendMessageW(src, WM_GETICON, ICON_BIG, 0);
+		if (!big) big = (HICON)GetClassLongPtrW(src, GCLP_HICON);
+		HICON sml = (HICON)SendMessageW(src, WM_GETICON, ICON_SMALL, 0);
+		if (!sml) sml = (HICON)GetClassLongPtrW(src, GCLP_HICONSM);
+		if (big) SendMessageW(dst, WM_SETICON, ICON_BIG,   (LPARAM)big);
+		if (sml) SendMessageW(dst, WM_SETICON, ICON_SMALL, (LPARAM)sml);
+	}
+#endif
+	g_hosts.push_back(host);
+	return host;
+}
+
+void NukeUI::HostSetContent(void* hostPtr, const std::function<void()>& draw)
+{
+	if (NukeUIHost* h = (NukeUIHost*)hostPtr) h->content = draw;
+}
+
+bool NukeUI::HostAlive(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	return h && h->alive && h->win && !glfwWindowShouldClose(h->win);
+}
+
+bool NukeUI::HostFocused(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	return h && h->win && glfwGetWindowAttrib(h->win, GLFW_FOCUSED);
+}
+
+void NukeUI::HostFocus(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (h && h->win) glfwFocusWindow(h->win);
+}
+
+void NukeUI::HostSetContentFlags(void* hostPtr, int imguiWindowFlags)
+{
+	if (NukeUIHost* h = (NukeUIHost*)hostPtr) h->contentFlags = imguiWindowFlags;
+}
+
+void NukeUI::HostBeginDrag(void* hostPtr, float hotX, float hotY)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (!h || !h->win) return;
+	h->dragging = true; h->hotX = hotX; h->hotY = hotY;
+#ifdef _WIN32
+	// Snap under the cursor right away — a tear-off must not flash at a stale position.
+	POINT cp; GetCursorPos(&cp);
+	glfwSetWindowPos(h->win, cp.x - (int)hotX, cp.y - (int)hotY);
+#endif
+	glfwFocusWindow(h->win);
+}
+
+bool NukeUI::HostDragging(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	return h && h->dragging;
+}
+
+bool NukeUI::HostDockDrop(void* hostPtr, float* mainX, float* mainY)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (!h || !h->dockDrop) return false;
+	h->dockDrop = false;
+	if (mainX) *mainX = h->dropX;
+	if (mainY) *mainY = h->dropY;
+	return true;
+}
+
+void NukeUI::HostCancelClose(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (h && h->win) { glfwSetWindowShouldClose(h->win, GLFW_FALSE); h->alive = true; }
+}
+
+void NukeUI::HostSetTitle(void* hostPtr, const char* title)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (!h || !title || h->title == title) return;
+	h->title = title;                       // content tab text (imgui strips "##..." itself)
+	if (h->win)
+	{
+		// The OS/taskbar title must not show the imgui "###id" suffix.
+		std::string os = h->title;
+		const size_t hash = os.find("##");
+		if (hash != std::string::npos) os.resize(hash);
+		glfwSetWindowTitle(h->win, os.c_str());
+	}
+}
+
+void NukeUI::HostDestroy(void* hostPtr)
+{
+	NukeUIHost* h = (NukeUIHost*)hostPtr;
+	if (!h) return;
+	for (size_t i = 0; i < g_hosts.size(); ++i)
+		if (g_hosts[i] == h) { g_hosts.erase(g_hosts.begin() + i); break; }
+	if (h->win && g_render)
+	{
+#ifdef _WIN32
+		g_render->uiViewportDestroy((void*)glfwGetWin32Window(h->win));   // park its swap chain
+#endif
+		glfwDestroyWindow(h->win);
+	}
+	if (h->ctx) ImGui::DestroyContext(h->ctx);
+	delete h;
+}
+
+// One frame for every live host: own-context NewFrame -> fullscreen content window ->
+// Render -> the renderer seam. Runs inside NukeUI::Frame AFTER the main context's pass.
+static void TickHosts()
+{
+	if (g_hosts.empty() || !g_render) return;
+	ImGuiContext* mainCtx = ImGui::GetCurrentContext();
+	const float dt = ImGui::GetIO().DeltaTime > 0 ? ImGui::GetIO().DeltaTime : 1.0f / 60.0f;
+	static std::vector<NukeUIDrawList>          hostLists;
+	static std::vector<std::vector<NukeUICmd>>  hostCmds;
+	static uint64_t tickNo = 0;
+	++tickNo;
+	for (NukeUIHost* h : g_hosts)
+	{
+		if (!h->win) continue;
+		if (glfwWindowShouldClose(h->win)) { h->alive = false; continue; }   // the app decides (HostAlive)
+		// FPS: an idle UNFOCUSED tool window doesn't need 60 Hz — tick it every 4th frame
+		// (render + readback + blit all skipped). Focus, drags and resizes run full rate.
+		const bool interacting = h->dragging || h->rsEdge != 0 || glfwGetWindowAttrib(h->win, GLFW_FOCUSED);
+		if (!interacting && ((tickNo + ((uintptr_t)h >> 4)) & 3) != 0) continue;
+
+#ifdef _WIN32
+		// DRAG-TO-DOCK follow mode: the window rides the cursor while the button is held —
+		// a live UI-level drag (rendering keeps running), NOT the OS modal move loop.
+		// Docking is EXPLICIT: only a release inside the DOCK TARGET (the overlay the app
+		// shows while a host drags over the main window) docks it back — releasing
+		// anywhere else just places the OS window there, including on top of the main
+		// window. The button state is the OR of both contexts: a tear-off drag holds
+		// capture in the MAIN window, an inner-title-bar drag holds it in the HOST.
+		if (h->dragging)
+		{
+			POINT cp; GetCursorPos(&cp);
+			glfwSetWindowPos(h->win, cp.x - (int)h->hotX, cp.y - (int)h->hotY);
+			bool overMain = false, overTarget = false;
+			POINT mp = cp;
+			if (g_mainHwnd && !IsIconic((HWND)g_mainHwnd) && ScreenToClient((HWND)g_mainHwnd, &mp))
+			{
+				RECT rc; GetClientRect((HWND)g_mainHwnd, &rc);
+				overMain = PtInRect(&rc, mp) != 0;
+				overTarget = overMain && g_dockTargetValid &&
+				             mp.x >= g_dockTarget[0] && mp.y >= g_dockTarget[1] &&
+				             mp.x <  g_dockTarget[0] + g_dockTarget[2] &&
+				             mp.y <  g_dockTarget[1] + g_dockTarget[3];
+			}
+			g_hostDragOverMain = overMain;
+			glfwSetWindowOpacity(h->win, overTarget ? 0.45f : 0.85f);   // "will dock" hint
+			const bool down = mainCtx->IO.MouseDown[0] || h->ctx->IO.MouseDown[0];
+			if (!down)
+			{
+				h->dragging = false;
+				g_hostDragOverMain = false;
+				glfwSetWindowOpacity(h->win, 1.0f);
+				if (overTarget) { h->dockDrop = true; h->dropX = (float)mp.x; h->dropY = (float)mp.y; }
+			}
+		}
+#endif
+
+		int fw = 0, fh = 0;
+		glfwGetFramebufferSize(h->win, &fw, &fh);
+		if (fw < 8 || fh < 8) continue;   // minimized: sit the frame out
+
+		ImGui::SetCurrentContext(h->ctx);
+		ImGuiIO& hio = ImGui::GetIO();
+		hio.DisplaySize = ImVec2((float)fw, (float)fh);
+		hio.DeltaTime   = dt;
+		ImGui::NewFrame();
+		ImGui::SetNextWindowPos(ImVec2(0, 0));   // pinned: imgui never moves it INSIDE the host
+		ImGui::SetNextWindowSize(hio.DisplaySize);
+		// A real title bar = the window's TAB (and, with the system frame gone, the whole
+		// chrome): dragging it starts the drag-to-dock follow, the X closes the OS window,
+		// the styled border is the visual frame — all in the editor theme.
+		bool hostOpen = true;
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+		ImGui::Begin((h->title + "###hostcontent").c_str(), &hostOpen,
+		             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+		             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings |
+		             h->contentFlags);
+		if (h->content) h->content();
+		ImGui::End();
+		ImGui::PopStyleVar();
+		if (!hostOpen) glfwSetWindowShouldClose(h->win, GLFW_TRUE);   // imgui X == OS close
+		// The user grabbed the content window's title bar: cancel imgui's window move and
+		// turn it into the OS-window follow drag (with the grab point under the cursor).
+		if (!h->dragging && h->rsEdge == 0)
+		{
+			ImGuiContext* hg = ImGui::GetCurrentContext();
+			if (hg->MovingWindow && hg->MovingWindow->RootWindow &&
+			    strstr(hg->MovingWindow->RootWindow->Name, "###hostcontent") &&
+			    ImGui::IsMouseDragging(0, 4.0f))
+			{
+				const ImVec2 m = ImGui::GetMousePos();
+				ImGui::ClearActiveID();
+				hg->MovingWindow = nullptr;
+				NukeUI::HostBeginDrag(h, m.x, m.y);
+			}
+		}
+#ifdef _WIN32
+		// Borderless RESIZE: 6px edges belong to the frame. Hover feedback via standard
+		// resize cursors; drag resizes (left/top edges also move the window).
+		if (!h->dragging)
+		{
+			static GLFWcursor* curEW   = glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);
+			static GLFWcursor* curNS   = glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
+			static GLFWcursor* curMove = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);
+			const float edge = 6.0f;
+			if (h->rsEdge == 0)
+			{
+				int e = 0;
+				const ImVec2 mp = hio.MousePos;
+				if (mp.x >= 0 && mp.y >= 0 && mp.x < hio.DisplaySize.x && mp.y < hio.DisplaySize.y)
+				{
+					if (mp.x < edge) e |= 1; else if (mp.x >= hio.DisplaySize.x - edge) e |= 2;
+					if (mp.y < edge) e |= 4; else if (mp.y >= hio.DisplaySize.y - edge) e |= 8;
+				}
+				if (e)
+				{
+					glfwSetCursor(h->win, ((e & 3) && (e & 12)) ? curMove : (e & 3) ? curEW : curNS);
+					if (ImGui::IsMouseClicked(0))
+					{
+						h->rsEdge = e;
+						glfwGetWindowSize(h->win, &h->rsStartW, &h->rsStartH);
+						glfwGetWindowPos(h->win, &h->rsStartX, &h->rsStartY);
+						GetCursorPos(&h->rsCur);
+						ImGui::ClearActiveID();   // the frame owns this gesture, not a widget
+					}
+				}
+				else glfwSetCursor(h->win, nullptr);
+			}
+			else
+			{
+				POINT cp; GetCursorPos(&cp);
+				const int dx = cp.x - h->rsCur.x, dy = cp.y - h->rsCur.y;
+				int nw = h->rsStartW, nh = h->rsStartH, nx = h->rsStartX, ny = h->rsStartY;
+				if (h->rsEdge & 2) nw += dx;
+				if (h->rsEdge & 1) { nw -= dx; nx += dx; }
+				if (h->rsEdge & 8) nh += dy;
+				if (h->rsEdge & 4) { nh -= dy; ny += dy; }
+				if (nw < 220) { if (h->rsEdge & 1) nx -= 220 - nw; nw = 220; }
+				if (nh < 140) { if (h->rsEdge & 4) ny -= 140 - nh; nh = 140; }
+				glfwSetWindowPos(h->win, nx, ny);
+				glfwSetWindowSize(h->win, nw, nh);
+				if (!hio.MouseDown[0] && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+				{
+					h->rsEdge = 0;
+					glfwSetCursor(h->win, nullptr);
+				}
+			}
+		}
+#endif
+		ImGui::Render();
+
+		ImDrawData* dd = ImGui::GetDrawData();
+		if (dd)
+		{
+			UpdateTextures(dd);
+			NukeUIDrawData nd{};
+			BuildDrawData(dd, hostLists, hostCmds, nd);
+#ifdef _WIN32
+			g_render->uiViewportRender((void*)glfwGetWin32Window(h->win), fw, fh, nd);
+#endif
+		}
+	}
+	ImGui::SetCurrentContext(mainCtx);
+}
+
+// ==== DETACHABLE DOCUMENT WINDOWS (generic: editor panels AND module editors) ==================
+// DocWindow wraps the whole docked/detached lifecycle that the asset editors pioneered
+// (task #135) so ANY document window — text editor, .nutile editor, future module tools —
+// gets the same normal drag-docking with one call per frame.
+struct NukeUIDoc
+{
+	std::function<void()> draw;      // refreshed every DocWindow call
+	std::string title;
+	void* host = nullptr;
+	int   flags = 0, w = 720, h = 520;
+	bool  detached = false;
+	bool  dragOut = false;           // torn off mid-drag: the new host picks the drag up
+	bool  wantDock = false;          // host dropped onto the main window
+	bool  hasDrop = false; float dropX = 0, dropY = 0;
+	bool  wantFocus = false;
+	bool  closeReported = false;     // OS close reported once; re-assert open = cancel it
+	bool  panel = false;             // persistent panel: never auto-detached
+	unsigned lastSeen = 0;           // frame stamp for garbage collection
+};
+static std::map<std::string, NukeUIDoc> g_uiDocs;
+static bool     g_docDetachDefault = false;
+static unsigned g_uiFrameNo = 0;
+
+static void DocFrameBegin() { ++g_uiFrameNo; }
+
+void NukeUI::DocDetachDefault(bool detached) { g_docDetachDefault = detached; }
+
+bool NukeUI::DocDetached(const char* id)
+{
+	auto it = g_uiDocs.find(id);
+	return it != g_uiDocs.end() && it->second.host != nullptr;
+}
+
+void NukeUI::DocFocus(const char* id)
+{
+	auto it = g_uiDocs.find(id);
+	if (it != g_uiDocs.end()) it->second.wantFocus = true;
+}
+
+void NukeUI::DocDetachAll(bool detached)
+{
+	for (auto& kv : g_uiDocs)
+	{
+		if (kv.second.panel) continue;   // panels move only by the user's own drag
+		if (detached) { if (!kv.second.host) kv.second.detached = true; }
+		else if (kv.second.host) kv.second.wantDock = true;
+	}
+}
+
+static void DocWindowImpl(const char* id, const char* title, bool* p_open,
+                          int imguiWindowFlags, int width, int height,
+                          const std::function<void()>& draw, bool isPanel);
+
+void NukeUI::DocWindow(const char* id, const char* title, bool* p_open,
+                       int imguiWindowFlags, int width, int height,
+                       const std::function<void()>& draw)
+{
+	DocWindowImpl(id, title, p_open, imguiWindowFlags, width, height, draw, false);
+}
+
+void NukeUI::DocPanel(const char* id, const char* title, bool* p_open,
+                      int imguiWindowFlags, int width, int height,
+                      const std::function<void()>& draw)
+{
+	DocWindowImpl(id, title, p_open, imguiWindowFlags, width, height, draw, true);
+}
+
+static void DocWindowImpl(const char* id, const char* title, bool* p_open,
+                          int imguiWindowFlags, int width, int height,
+                          const std::function<void()>& draw, bool isPanel)
+{
+	if (!id || !p_open || !*p_open) return;
+	auto ins = g_uiDocs.emplace(id, NukeUIDoc{});
+	NukeUIDoc& d = ins.first->second;
+	if (ins.second)
+	{
+		d.panel = isPanel;
+		d.detached = isPanel ? false : g_docDetachDefault;   // panels ALWAYS start docked
+	}
+	d.draw = draw; d.title = title ? title : id;
+	d.flags = imguiWindowFlags; d.w = width; d.h = height;
+	d.lastSeen = g_uiFrameNo;
+
+	if (g_nativeViewports)
+	{
+		// NATIVE viewports (Vulkan): imgui owns the whole lifecycle — INSIDE the main
+		// window the window is embedded; dragged past the edge it becomes its own OS
+		// window; dragged back it merges again. No forced modes, no hosts, no gestures:
+		// those are the D3D fallback and stay dormant.
+		if (d.wantDock)  { d.detached = false; d.wantDock = false; }
+		if (d.wantFocus) { ImGui::SetNextWindowFocus(); d.wantFocus = false; }
+		ImGui::SetNextWindowSize(ImVec2((float)d.w, (float)d.h), ImGuiCond_FirstUseEver);
+		if (ImGui::Begin(d.title.c_str(), p_open, d.flags))
+		{
+			if (d.draw) d.draw();
+		}
+		ImGui::End();
+		return;
+	}
+
+	// Dropped back / preference turned off: leave the host (never from inside its tick).
+	if (d.wantDock)
+	{
+		if (d.host) { NukeUI::HostDestroy(d.host); d.host = nullptr; }
+		d.detached = false; d.wantDock = false; d.wantFocus = true;
+	}
+
+	if (d.detached)
+	{
+		if (!d.host)
+		{
+			std::string osTitle = d.title;   // OS title without the imgui "###id" suffix
+			const size_t hash = osTitle.find("##");
+			if (hash != std::string::npos) osTitle.resize(hash);
+			d.host = NukeUI::HostCreate(osTitle.c_str(), d.w, d.h);
+			if (d.host) NukeUI::HostSetTitle(d.host, d.title.c_str());   // tab keeps the FULL label
+			if (!d.host) { d.detached = false; }   // window creation failed: fall back to docked
+			else
+			{
+				const std::string key = id;        // capture the KEY — the map can rehash
+				NukeUI::HostSetContent(d.host, [key]()
+				{
+					auto it = g_uiDocs.find(key);
+					if (it != g_uiDocs.end() && it->second.draw) it->second.draw();
+				});
+			}
+		}
+		if (d.host)
+		{
+			if (d.dragOut) { NukeUI::HostBeginDrag(d.host, d.w * 0.5f, 12.0f); d.dragOut = false; }
+			NukeUI::HostSetTitle(d.host, d.title.c_str());
+			NukeUI::HostSetContentFlags(d.host, d.flags);
+			float dx = 0, dy = 0;
+			if (NukeUI::HostDockDrop(d.host, &dx, &dy)) { d.wantDock = true; d.hasDrop = true; d.dropX = dx; d.dropY = dy; }
+			if (d.wantFocus) { NukeUI::HostFocus(d.host); d.wantFocus = false; }
+			if (!NukeUI::HostAlive(d.host))
+			{
+				if (d.closeReported && *p_open) { NukeUI::HostCancelClose(d.host); d.closeReported = false; }
+				else { *p_open = false; d.closeReported = true; }
+			}
+			return;                                // content is drawn by the host tick
+		}
+	}
+
+	// ---- docked: a normal imgui window in the CURRENT (main) context ----
+	if (d.wantFocus) { ImGui::SetNextWindowFocus(); d.wantFocus = false; }
+	if (d.hasDrop)
+	{
+		// Re-docked by drag: appear where the user dropped it (title bar under the cursor).
+		d.hasDrop = false;
+		ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+		ImGui::SetNextWindowPos(ImVec2(ImMax(0.0f, d.dropX - 220.0f), ImMax(0.0f, d.dropY - 10.0f)), ImGuiCond_Always);
+	}
+	ImGui::SetNextWindowSize(ImVec2((float)d.w, (float)d.h), ImGuiCond_FirstUseEver);
+	// The TITLE is the imgui identity verbatim: panels pass a stable name ("Console") so
+	// the user's saved dock layout (imgui.ini) keeps working; documents with changing
+	// titles (dirty markers) embed their own "###<id>" suffix in the title.
+	const std::string label = d.title;
+	ImGuiWindow* self = nullptr;
+	if (ImGui::Begin(label.c_str(), p_open, d.flags))
+	{
+		self = ImGui::GetCurrentWindow();
+		if (d.draw) d.draw();
+	}
+	else self = ImGui::GetCurrentWindow();
+	ImGui::End();
+
+	// Tear-off: this window's title bar dragged past the main-window edge, or the cursor
+	// pinned against the virtual-screen edge (a maximized main window clamps it there).
+	ImGuiContext* g = ImGui::GetCurrentContext();
+	if (self && g->MovingWindow && g->MovingWindow->RootWindow == self->RootWindow)
+	{
+		const ImVec2 m  = ImGui::GetMousePos();
+		const ImVec2 ds = ImGui::GetIO().DisplaySize;
+		const float out = 12.0f;
+		const bool leftWin = m.x < -out || m.y < -out || m.x >= ds.x + out || m.y >= ds.y + out;
+		bool clamped = false;
+#ifdef _WIN32
+		{
+			POINT cp; GetCursorPos(&cp);
+			const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+			const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+			clamped = cp.x <= vx || cp.y <= vy || cp.x >= vx + vw - 1 || cp.y >= vy + vh - 1;
+		}
+#endif
+		if (leftWin || clamped)
+		{
+			d.detached = true; d.dragOut = true;
+			ImGui::ClearActiveID();                // hand the drag over to the host window
+			g->MovingWindow = nullptr;
+		}
+	}
+}
+
+// Documents whose owner stopped calling DocWindow this frame are gone — free their hosts.
+static void CollectDocs()
+{
+	for (auto it = g_uiDocs.begin(); it != g_uiDocs.end(); )
+	{
+		if (it->second.lastSeen != g_uiFrameNo)
+		{
+			if (it->second.host) NukeUI::HostDestroy(it->second.host);
+			it = g_uiDocs.erase(it);
+		}
+		else ++it;
+	}
+}
+
 void NukeUI::Init(iRender* renderer)
 {
 	g_render = renderer;
@@ -316,15 +929,32 @@ void NukeUI::Init(iRender* renderer)
 	}
 	io.DisplaySize = ImVec2((float)s_dispW, (float)s_dispH);
 
-	// Multi-viewport: panels dragged out of (or forced off) the main window become
-	// NATIVE OS windows. The platform side is imgui_impl_glfw mounted on the renderer's
-	// own GLFW window — both modules link the SAME glfw3.dll, so the renderer's event
-	// polling pumps the secondary windows too, and InitForOther(install_callbacks=true)
-	// CHAINS the renderer's existing input callbacks instead of replacing them.
+	// WINDOWING MODEL, per backend:
+	//  * Vulkan (EnableNativeViewports(true)): NATIVE imgui multi-viewport — any window
+	//    dragged past the main window becomes a real per-window swapchain OS window with
+	//    full dock previews. This is the stack every multi-window editor runs on.
+	//  * D3D (default off): single-window model (task #134) — the imgui platform-window
+	//    churn raced DXGI into ACCESS_DENIED device removals, so detached windows go
+	//    through NukeUI HOSTS (GDI-blit, zero DXGI per window) instead.
+	// imgui_impl_glfw is mounted on the renderer's GLFW window either way:
+	// InitForOther(install_callbacks=true) CHAINS the renderer's input callbacks.
 	if (GLFWwindow* mainWin = (GLFWwindow*)renderer->nativeWindow())
 	{
-		io.ConfigFlags  |= ImGuiConfigFlags_ViewportsEnable;
-		io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;   // we render via the seam
+		if (g_nativeViewports)
+		{
+			io.ConfigFlags  |= ImGuiConfigFlags_ViewportsEnable;
+			io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;   // rendered via the seam
+			// NO system frame: the chrome is the imgui title bar in the editor theme —
+			// which also means EVERY drag goes through imgui, so the dock anchors show
+			// whether the window is embedded or already its own OS window.
+			io.ConfigViewportsNoDecoration = true;
+			// The dragged window turns translucent over dock targets — anchors stay visible.
+			io.ConfigDockingTransparentPayload = true;
+			// A floating window is ALWAYS its own OS window — it never silently embeds
+			// into the main window just because it overlaps it (user demand): undocked =
+			// detached, period. Back into the layout ONLY via the dock anchors.
+			io.ConfigViewportsNoAutoMerge = true;
+		}
 		ImGui_ImplGlfw_InitForOther(mainWin, true);
 		g_glfwPlatform = true;
 		ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
@@ -337,8 +967,10 @@ void NukeUI::Init(iRender* renderer)
 #ifdef _WIN32
 		// Secondary windows inherit the main window's icons (title bar + taskbar).
 		g_mainHwnd = (void*)glfwGetWin32Window(mainWin);
+		// (With multi-viewport off the backend leaves Platform_CreateWindow null — only
+		// wrap it when it exists, the wrapper must never sit on a null original.)
 		g_origCreateWindow = pio.Platform_CreateWindow;
-		pio.Platform_CreateWindow = CreateWindowWithIcon;
+		if (g_origCreateWindow) pio.Platform_CreateWindow = CreateWindowWithIcon;
 #endif
 	}
 	else

@@ -52,6 +52,10 @@ set(DEPLOY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../NukeEngine/x64/$<CONFIG>")
 add_custom_command(TARGET NukeImGui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DEPLOY_DIR}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:NukeImGui>" "${DEPLOY_DIR}/"
+    # Import lib to the LEGACY link path (the hand-maintained editor vcxproj + companion
+    # modules link NukeImGui/build/<config>; the superbuild's binary dir is elsewhere).
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/build/$<CONFIG>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:NukeImGui>" "${CMAKE_CURRENT_SOURCE_DIR}/build/$<CONFIG>/"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DEPLOY_DIR}/fonts"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/lucide.ttf" "${DEPLOY_DIR}/fonts/"
     COMMENT "Deploying NukeImGui.dll + fonts/lucide.ttf next to the editor"
