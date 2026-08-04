@@ -2,6 +2,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"   // MovingWindow/ClearActiveID — host drag-to-dock (task #135)
 #include "IconsLucide.h"      // ICON_LC_* + ICON_MIN_LC / ICON_MAX_LC range
+#include <array>
 #include <string>
 #include "backends/imgui_impl_glfw.h"   // multi-viewport PLATFORM backend (native OS windows)
 #include <render/irender.h>   // engine: iRender + NukeUIDrawData (neutral seam)
@@ -165,10 +166,16 @@ void NukeUI::SetDisplaySize(int width, int height)
 	if (width > 0 && height > 0) { s_dispW = width; s_dispH = height; }
 }
 
-void NukeUI::MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY)
+void NukeUI::MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY,
+                           unsigned int rangeMin, unsigned int rangeMax)
 {
 	ImGuiIO& io = ImGui::GetIO();
-	static const ImWchar ranges[] = { ICON_MIN_LC, ICON_MAX_LC, 0 }; // must outlive the atlas build
+	// Each icon font brings its OWN codepoints; the ranges must outlive the atlas build, so they
+	// are kept in a list that only grows.
+	static std::vector<std::array<ImWchar, 3>> kept;
+	if (!rangeMin || !rangeMax) { rangeMin = ICON_MIN_LC; rangeMax = ICON_MAX_LC; }
+	kept.push_back({ (ImWchar)rangeMin, (ImWchar)rangeMax, 0 });
+	const ImWchar* ranges = kept.back().data();
 	ImFontConfig cfg;
 	cfg.MergeMode        = true;        // merge onto the previously-added main font
 	cfg.PixelSnapH       = true;
@@ -436,6 +443,125 @@ bool NukeUI::HostFocused(void* hostPtr)
 	return h && h->win && glfwGetWindowAttrib(h->win, GLFW_FOCUSED);
 }
 
+// Minimize + maximize/restore for the CURRENT imgui window (call right after Begin). The OS
+// window is either the editor-owned host or, with native viewports, the window's OWN platform
+// viewport — a docked window has neither and draws nothing. Painted on the window's foreground
+// list with a manual hit test: a real widget in the title bar would fight imgui's own close
+// button and the title drag, so the click is consumed here and the move is cancelled.
+void NukeUI::WindowCaptionButtons(void* hostPtr)
+{
+	ImGuiWindow* win = ImGui::GetCurrentWindow();
+	if (!win || (win->Flags & ImGuiWindowFlags_NoTitleBar)) return;
+	GLFWwindow* os = nullptr;
+	ImGuiViewport* vp = win->Viewport;
+	const bool imguiOwned = !hostPtr;   // imgui drives this platform window's pos/size
+	if (hostPtr) os = ((NukeUIHost*)hostPtr)->win;
+	else if (vp && vp != ImGui::GetMainViewport() && (vp->Flags & ImGuiViewportFlags_IsPlatformWindow))
+		os = (GLFWwindow*)vp->PlatformHandle;
+	// No OS window of its own (the window still lives inside the main one): maximize/restore
+	// still work — they stretch the imgui window over its viewport — only minimize needs one.
+	const bool canMinimize = os != nullptr;
+
+	// Maximize state. An imgui-OWNED window must NOT be maximized through the OS: imgui pushes
+	// its own size every frame, Windows refuses it while maximized, and the pair fight forever
+	// (the swap chain resizes each frame). So "maximize" means: remember pos/size and stretch
+	// the imgui window over the monitor work area; restore puts them back. Only editor-owned
+	// hosts — whose size imgui does not drive — use the real OS maximize.
+	struct CapState { bool maxed = false; ImVec2 pos, size; };
+	static std::map<ImGuiID, CapState> capState;
+	CapState& cap = capState[win->ID];
+	if (imguiOwned && os && glfwGetWindowAttrib(os, GLFW_MAXIMIZED))
+		glfwRestoreWindow(os);   // heal a window an earlier build left OS-maximized
+
+	ImGuiContext& g = *ImGui::GetCurrentContext();
+	const float bh = win->TitleBarHeight;
+	const float slotW = bh + 4.0f;
+	const float y0 = win->Pos.y, y1 = y0 + bh;
+	const ImVec2 mp = ImGui::GetIO().MousePos;
+	const bool maxed = imguiOwned ? cap.maxed : (glfwGetWindowAttrib(os, GLFW_MAXIMIZED) != 0);
+	// Stretch over / restore from the monitor holding the window's centre.
+	auto toggleMax = [&]()
+	{
+		if (!imguiOwned)
+		{
+			if (maxed) glfwRestoreWindow(os); else glfwMaximizeWindow(os);
+			return;
+		}
+		if (cap.maxed)
+		{
+			ImGui::SetWindowPos(cap.pos);
+			ImGui::SetWindowSize(cap.size);
+			cap.maxed = false;
+			return;
+		}
+		cap.pos = win->Pos;
+		cap.size = win->Size;
+		const ImVec2 c(win->Pos.x + win->Size.x * 0.5f, win->Pos.y + win->Size.y * 0.5f);
+		ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+		const ImGuiPlatformMonitor* best = nullptr;
+		for (int mi = 0; mi < pio.Monitors.Size; ++mi)
+		{
+			const ImGuiPlatformMonitor& m = pio.Monitors[mi];
+			if (c.x >= m.WorkPos.x && c.x < m.WorkPos.x + m.WorkSize.x
+			    && c.y >= m.WorkPos.y && c.y < m.WorkPos.y + m.WorkSize.y) { best = &m; break; }
+			if (!best) best = &m;
+		}
+		if (best)
+		{
+			ImGui::SetWindowPos(best->WorkPos);
+			ImGui::SetWindowSize(best->WorkSize);
+			cap.maxed = true;
+		}
+	};
+	// Begin() clips the window's draw list to its INNER rect — the title bar is outside it, so
+	// anything drawn there is invisible. Replace the clip with the title bar itself (no
+	// intersect) for the buttons, then restore.
+	ImDrawList* dl = win->DrawList;   // the window's OWN list: always part of its draw data
+	dl->PushClipRect(ImVec2(win->Pos.x, y0), ImVec2(win->Pos.x + win->Size.x, y1), false);
+	struct ClipPop { ImDrawList* d; ~ClipPop() { d->PopClipRect(); } } clipPop{ dl };
+	bool overBtn = false;
+	// slot 0 = minimize, slot 1 = maximize/restore; imgui's close X owns the rightmost slot.
+	// Without an OS window of its own there is nothing to iconify — start at the maximize slot.
+	for (int slot = canMinimize ? 0 : 1; slot < 2; ++slot)
+	{
+		const float x1 = win->Pos.x + win->Size.x - slotW * (3 - slot) + 2.0f;
+		const float x2 = x1 + slotW - 4.0f;
+		const bool over = mp.x >= x1 && mp.x < x2 && mp.y >= y0 && mp.y < y1;
+		overBtn = overBtn || over;
+		if (over)
+			dl->AddRectFilled(ImVec2(x1, y0 + 1), ImVec2(x2, y1 - 1),
+			                  ImGui::GetColorU32(ImGuiCol_ButtonHovered), 3.0f);
+		const ImU32 gc = ImGui::GetColorU32(over ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+		const float cx = (x1 + x2) * 0.5f, cy = (y0 + y1) * 0.5f;
+		if (slot == 0)        // minimize: a dash
+			dl->AddLine(ImVec2(cx - 5, cy + 3), ImVec2(cx + 5, cy + 3), gc, 1.5f);
+		else if (!maxed)      // maximize: a box
+			dl->AddRect(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), gc, 0, 0, 1.5f);
+		else                  // restore: two offset boxes
+		{
+			dl->AddRect(ImVec2(cx - 5, cy - 2), ImVec2(cx + 2, cy + 5), gc, 0, 0, 1.5f);
+			dl->AddLine(ImVec2(cx - 2, cy - 5), ImVec2(cx + 5, cy - 5), gc, 1.5f);
+			dl->AddLine(ImVec2(cx + 5, cy - 5), ImVec2(cx + 5, cy + 2), gc, 1.5f);
+		}
+		if (over && ImGui::IsMouseClicked(0))
+		{
+			ImGui::ClearActiveID();
+			g.MovingWindow = nullptr;   // the click is the button's, not a title drag
+			if (slot == 0) { if (os) glfwIconifyWindow(os); }
+			else           toggleMax();
+		}
+	}
+	// double-click on the free title area = maximize toggle (Windows convention, never a roll-up)
+	if (!overBtn && mp.y >= y0 && mp.y < y1
+	    && mp.x >= win->Pos.x && mp.x < win->Pos.x + win->Size.x - slotW * 3
+	    && ImGui::IsMouseDoubleClicked(0))
+	{
+		ImGui::ClearActiveID();
+		g.MovingWindow = nullptr;
+		toggleMax();
+	}
+}
+
 void NukeUI::HostFocus(void* hostPtr)
 {
 	NukeUIHost* h = (NukeUIHost*)hostPtr;
@@ -575,6 +701,7 @@ static void TickHosts()
 		ImGui::NewFrame();
 		ImGui::SetNextWindowPos(ImVec2(0, 0));   // pinned: imgui never moves it INSIDE the host
 		ImGui::SetNextWindowSize(hio.DisplaySize);
+		ImGui::SetNextWindowCollapsed(false, ImGuiCond_Always);   // the host never "rolls up"
 		// This title bar is the whole chrome: drag = follow drag, X = OS close, border = frame.
 		bool hostOpen = true;
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
@@ -582,10 +709,12 @@ static void TickHosts()
 		             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
 		             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoSavedSettings |
 		             h->contentFlags);
+		NukeUI::WindowCaptionButtons(h);   // minimize / maximize next to imgui's close X
 		if (h->content) h->content();
 		ImGui::End();
 		ImGui::PopStyleVar();
 		if (!hostOpen) glfwSetWindowShouldClose(h->win, GLFW_TRUE);   // imgui X == OS close
+
 		// Title bar grabbed: cancel imgui's window move and turn it into the OS-window follow drag.
 		if (!h->dragging && h->rsEdge == 0)
 		{
@@ -755,8 +884,11 @@ static void DocWindowImpl(const char* id, const char* title, bool* p_open,
 		if (d.wantDock)  { d.detached = false; d.wantDock = false; }
 		if (d.wantFocus) { ImGui::SetNextWindowFocus(); d.wantFocus = false; }
 		ImGui::SetNextWindowSize(ImVec2((float)d.w, (float)d.h), ImGuiCond_FirstUseEver);
-		if (ImGui::Begin(d.title.c_str(), p_open, d.flags))
+		// NoCollapse: the title double-click maximizes (WindowCaptionButtons) instead of
+		// rolling the window up — imgui consumes that double-click inside Begin otherwise.
+		if (ImGui::Begin(d.title.c_str(), p_open, d.flags | ImGuiWindowFlags_NoCollapse))
 		{
+			NukeUI::WindowCaptionButtons();   // minimize/maximize once imgui gives it an OS window
 			if (d.draw) d.draw();
 		}
 		ImGui::End();

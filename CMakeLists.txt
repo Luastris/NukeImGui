@@ -58,5 +58,6 @@ add_custom_command(TARGET NukeImGui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_LINKER_FILE:NukeImGui>" "${CMAKE_CURRENT_SOURCE_DIR}/build/$<CONFIG>/"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DEPLOY_DIR}/fonts"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/lucide.ttf" "${DEPLOY_DIR}/fonts/"
-    COMMENT "Deploying NukeImGui.dll + fonts/lucide.ttf next to the editor"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/assets/nukefileicons.ttf" "${DEPLOY_DIR}/fonts/"
+    COMMENT "Deploying NukeImGui.dll + icon fonts next to the editor"
 )

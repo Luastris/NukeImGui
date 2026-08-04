@@ -31,9 +31,11 @@ namespace NukeUI
 	// Tell the UI the current framebuffer size (call on resize).
 	NUKEUI_API void SetDisplaySize(int width, int height);
 
-	// Merge an icon font into the atlas on top of the main font (ICON_LC_* glyphs).
-	// Call AFTER the app adds its main font, BEFORE the first frame.
-	NUKEUI_API void MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY = 0.0f);
+	// Merge an icon font into the atlas on top of the main font. `rangeMin/rangeMax` are that
+	// font's own codepoints (0,0 = the Lucide range); several icon fonts can be merged as long
+	// as their ranges do not overlap. Call AFTER the app adds its main font, BEFORE the first frame.
+	NUKEUI_API void MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY = 0.0f,
+	                              unsigned int rangeMin = 0, unsigned int rangeMax = 0);
 
 	// Host windows: a decorated OS window drawn through its OWN ImGui context (shared
 	// font atlas). Hosts tick inside Frame() after the main context.
@@ -52,6 +54,13 @@ namespace NukeUI
 	NUKEUI_API void  SetDockTarget(float x, float y, float w, float h);
 	NUKEUI_API bool  HostAlive(void* host);     // false once the user closed the OS window
 	NUKEUI_API bool  HostFocused(void* host);   // the OS window has keyboard focus
+
+	// Minimize + maximize/restore caption buttons for the CURRENT imgui window, drawn left of
+	// its close X. Call right after Begin(). Works for both window kinds the editor uses:
+	// an editor-owned host (pass its handle) and an imgui window living in its own platform
+	// viewport (pass null — the viewport's OS window is used). No-op for docked windows,
+	// which have no OS window of their own. Also turns a title double-click into maximize.
+	NUKEUI_API void  WindowCaptionButtons(void* host = nullptr);
 	NUKEUI_API void  HostFocus(void* host);     // raise + focus the OS window
 	NUKEUI_API void  HostCancelClose(void* host); // clear a pending OS close request (close-confirm Cancel)
 	NUKEUI_API void  HostSetTitle(void* host, const char* title); // retitle (OS title bar + content tab)
