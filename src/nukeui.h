@@ -1,10 +1,14 @@
 #pragma once
 #include <functional>
 
-#ifdef NUKEIMGUI_EXPORTS
-#define NUKEUI_API __declspec(dllexport)
+#ifdef _WIN32
+  #ifdef NUKEIMGUI_EXPORTS
+  #define NUKEUI_API __declspec(dllexport)
+  #else
+  #define NUKEUI_API __declspec(dllimport)
+  #endif
 #else
-#define NUKEUI_API __declspec(dllimport)
+  #define NUKEUI_API __attribute__((visibility("default")))
 #endif
 
 namespace nuke { class iRender; }

@@ -18,6 +18,9 @@
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h> // glfwGetWin32Window (main window HWND -> icon source)
+#else
+#include <GLFW/glfw3.h>       // window/input plumbing is GLFW on every platform
+struct POINT { long x = 0, y = 0; };   // NukeUIHost::rsCur — only fed by the Windows chrome path
 #endif
 
 struct GLFWwindow;
@@ -29,6 +32,64 @@ static std::vector<std::function<void()>>  g_callbacks;
 static bool                                g_glfwPlatform = false;   // imgui_impl_glfw mounted (viewports on)
 static void*                               g_mainHwnd = nullptr;     // main window (icon source for secondaries)
 static void (*g_origCreateWindow)(ImGuiViewport*) = nullptr;
+
+#ifndef _WIN32
+static void (*g_origSetWindowPos)(ImGuiViewport*, ImVec2) = nullptr;
+
+// Place-verify-correct window positioning (see the install site for the macOS rationale).
+static void SetWindowPosVerified(ImGuiViewport* v, ImVec2 pos)
+{
+	g_origSetWindowPos(v, pos);
+	GLFWwindow* w = (GLFWwindow*)v->PlatformHandle;
+	if (!w) return;
+	// A HIDDEN window is where the mis-set lives in the first place — readback there is
+	// not trustworthy either. Defer: the show-wrapper re-asserts the position once visible.
+	if (!glfwGetWindowAttrib(w, GLFW_VISIBLE)) return;
+	int ax = 0, ay = 0;
+	glfwGetWindowPos(w, &ax, &ay);
+	const float e1x = (float)ax - pos.x, e1y = (float)ay - pos.y;
+	if (fabsf(e1x) <= 2.0f && fabsf(e1y) <= 2.0f) return;   // honest platform: done
+
+	// Second sample: shift-compensated attempt (solves a pure offset outright).
+	g_origSetWindowPos(v, ImVec2(pos.x - e1x, pos.y - e1y));
+	int bx = 0, by = 0;
+	glfwGetWindowPos(w, &bx, &by);
+	if (fabsf((float)bx - pos.x) <= 2.0f && fabsf((float)by - pos.y) <= 2.0f) return;
+
+	// Affine per-axis: actual = a*set + b from the two samples; invert for the exact target.
+	auto solve = [](float s1, float a1, float s2, float a2, float want) -> float
+	{
+		const float ds = s2 - s1;
+		if (fabsf(ds) < 0.5f) return want;
+		const float a = (a2 - a1) / ds;
+		if (fabsf(a) < 0.25f) return want;     // degenerate (platform ignoring us): give up
+		const float b = a1 - a * s1;
+		return (want - b) / a;
+	};
+	g_origSetWindowPos(v, ImVec2(solve(pos.x, (float)ax, pos.x - e1x, (float)bx, pos.x),
+	                             solve(pos.y, (float)ay, pos.y - e1y, (float)by, pos.y)));
+}
+
+// GLFW/macOS has a history of size-sets REPOSITIONING the window (glfw#1553, refixed and
+// re-broken across versions): lock the position across every size change.
+static void (*g_origSetWindowSize)(ImGuiViewport*, ImVec2) = nullptr;
+static void SetWindowSizePosLocked(ImGuiViewport* v, ImVec2 size)
+{
+	g_origSetWindowSize(v, size);
+	if (g_origSetWindowPos) SetWindowPosVerified(v, v->Pos);
+}
+
+// The broken placement happens at CREATION: the glfw backend positions the freshly created
+// (still HIDDEN) window with a direct glfwSetWindowPos — off-target on macOS/GLFW 3.5 — and
+// then suppresses its own pos event, so imgui never learns the window is 600px away from
+// its hitboxes. Re-assert the viewport position right after the window becomes visible.
+static void (*g_origShowWindow)(ImGuiViewport*) = nullptr;
+static void ShowWindowVerified(ImGuiViewport* v)
+{
+	g_origShowWindow(v);
+	SetWindowPosVerified(v, v->Pos);
+}
+#endif
 
 // Platform-backend window creation wrapper: a new secondary OS window inherits the main window's icons.
 static void CreateWindowWithIcon(ImGuiViewport* v)
@@ -204,6 +265,21 @@ void NukeUI::Frame()
 	{
 		// The GLFW backend owns DisplaySize / DeltaTime / mouse state for the whole viewport set.
 		ImGui_ImplGlfw_NewFrame();
+		// Headless/remote sessions can enumerate ZERO displays (CGDisplay/X denied) and imgui
+		// asserts on an empty monitor list with viewports on — synthesize one over the main
+		// window so the frame proceeds; a real session repopulates the list next change.
+		ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+		if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) && pio.Monitors.Size == 0)
+		{
+			ImGuiPlatformMonitor mon;
+			mon.MainPos  = mon.WorkPos  = ImVec2(0, 0);
+			mon.MainSize = mon.WorkSize = (io.DisplaySize.x > 0 && io.DisplaySize.y > 0)
+			                              ? io.DisplaySize : ImVec2(1280, 720);
+			pio.Monitors.push_back(mon);
+			// A display-less session must never PERSIST layout: window placements computed
+			// against the synthetic monitor would poison imgui.ini for real sessions.
+			io.IniFilename = nullptr;
+		}
 	}
 	else
 	{
@@ -241,6 +317,27 @@ void NukeUI::Frame()
 	if (g_glfwPlatform && (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable))
 	{
 		ImGui::UpdatePlatformWindows();
+#ifndef _WIN32
+		// Position coherence: hitboxes live at imgui's viewport Pos, pixels at the OS window.
+		// Diverged (AppKit constraints, GLFW quirks) → adopt the OS position ONE-WAY via
+		// PlatformRequestMove. Never re-assert in a loop: an async mover turns that into a
+		// 60fps tug-of-war and the window visibly oscillates.
+		{
+			ImGuiPlatformIO& gpio = ImGui::GetPlatformIO();
+			ImGuiContext* gctx = ImGui::GetCurrentContext();
+			for (int i = 1; i < gpio.Viewports.Size; ++i)
+			{
+				ImGuiViewport* v = gpio.Viewports[i];
+				GLFWwindow* w = (GLFWwindow*)v->PlatformHandle;
+				if (!w || !glfwGetWindowAttrib(w, GLFW_VISIBLE)) continue;
+				if (gctx->MovingWindow) continue;   // never fight a live imgui drag
+				int ox = 0, oy = 0;
+				glfwGetWindowPos(w, &ox, &oy);
+				if (fabsf((float)ox - v->Pos.x) <= 2.0f && fabsf((float)oy - v->Pos.y) <= 2.0f) continue;
+				v->PlatformRequestMove = true;
+			}
+		}
+#endif
 		ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
 		static std::vector<NukeUIDrawList>         vpLists;   // scratch reused per viewport
 		static std::vector<std::vector<NukeUICmd>> vpCmds;
@@ -320,6 +417,47 @@ struct NukeUIHost
 	POINT rsCur{};
 };
 static std::vector<NukeUIHost*> g_hosts;
+static GLFWwindow* g_mainGlfw = nullptr;   // the renderer's main window (portable host math)
+
+
+#ifdef __APPLE__
+// nukeui_cocoa.mm: ABSOLUTE cursor/button state from the OS. glfw's per-window cursor is
+// event-driven on macOS — stale between deliveries, and window-pos + stale-client-cursor
+// feeds back into itself: the window then drifts entirely on its own.
+extern "C" void NukeUICocoaGlobalCursor(int* x, int* y);
+extern "C" bool NukeUICocoaMouseLeftDown(void);
+#endif
+
+// Global cursor in GLFW screen coordinates — the same space glfwSetWindowPos speaks.
+// macOS: an absolute OS query (never stale, never a feedback loop). Elsewhere: the
+// button-owning window's origin + client cursor (GLFW keeps reporting to that window).
+static void HostCursorGlobal(GLFWwindow* win, int& gx, int& gy)
+{
+#ifdef __APPLE__
+	(void)win;
+	NukeUICocoaGlobalCursor(&gx, &gy);
+#else
+	double cx = 0, cy = 0;
+	int wx = 0, wy = 0;
+	glfwGetCursorPos(win, &cx, &cy);
+	glfwGetWindowPos(win, &wx, &wy);
+	gx = wx + (int)cx;
+	gy = wy + (int)cy;
+#endif
+}
+
+// Physical left-button state for gesture release detection — must not depend on which
+// window the release event lands in.
+static bool HostMouseLeftDown(GLFWwindow* winA, GLFWwindow* winB)
+{
+#ifdef __APPLE__
+	(void)winA; (void)winB;
+	return NukeUICocoaMouseLeftDown();
+#else
+	return (winA && glfwGetMouseButton(winA, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS)
+	    || (winB && glfwGetMouseButton(winB, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
+#endif
+}
 static bool  g_nativeViewports = false;    // Vulkan: imgui multi-viewport ON (hosts = D3D fallback)
 static bool  g_hostDragOverMain = false;   // a host is drag-following with the cursor over main
 static float g_dockTarget[4] = {};         // dock drop zone, main-window client coords (x,y,w,h)
@@ -470,8 +608,12 @@ void NukeUI::WindowCaptionButtons(void* hostPtr)
 	struct CapState { bool maxed = false; ImVec2 pos, size; };
 	static std::map<ImGuiID, CapState> capState;
 	CapState& cap = capState[win->ID];
+#ifndef __APPLE__
+	// Windows-only heal: on macOS GLFW_MAXIMIZED ([NSWindow isZoomed]) lies for borderless
+	// windows and a per-frame restore animates the window up the screen ([window zoom:]).
 	if (imguiOwned && os && glfwGetWindowAttrib(os, GLFW_MAXIMIZED))
 		glfwRestoreWindow(os);   // heal a window an earlier build left OS-maximized
+#endif
 
 	ImGuiContext& g = *ImGui::GetCurrentContext();
 	const float bh = win->TitleBarHeight;
@@ -582,6 +724,14 @@ void NukeUI::HostBeginDrag(void* hostPtr, float hotX, float hotY)
 	// Snap under the cursor right away — a tear-off must not flash at a stale position.
 	POINT cp; GetCursorPos(&cp);
 	glfwSetWindowPos(h->win, cp.x - (int)hotX, cp.y - (int)hotY);
+#else
+	// Tear-off starts with the button held on the MAIN window — sample the cursor there.
+	if (g_mainGlfw)
+	{
+		int gx = 0, gy = 0;
+		HostCursorGlobal(g_mainGlfw, gx, gy);
+		glfwSetWindowPos(h->win, gx - (int)hotX, gy - (int)hotY);
+	}
 #endif
 	glfwFocusWindow(h->win);
 }
@@ -688,6 +838,58 @@ static void TickHosts()
 				if (overTarget) { h->dockDrop = true; h->dropX = (float)mp.x; h->dropY = (float)mp.y; }
 			}
 		}
+#else
+		// Portable drag-to-dock follow. Cursor and button come from ABSOLUTE OS state
+		// (HostCursorGlobal/HostMouseLeftDown) — the gesture must depend on neither event
+		// delivery nor the window's own position, or it feeds back into itself.
+		if (h->dragging)
+		{
+			// The physical button is THE gesture: released -> the drag is over, this frame.
+			if (!HostMouseLeftDown(g_mainGlfw, h->win))
+			{
+				int gx = 0, gy = 0;
+				HostCursorGlobal(h->win, gx, gy);
+				bool overMain = false, overTarget = false;
+				float mx = 0, my = 0;
+				if (g_mainGlfw && !glfwGetWindowAttrib(g_mainGlfw, GLFW_ICONIFIED))
+				{
+					int mwx = 0, mwy = 0, mww = 0, mwh = 0;
+					glfwGetWindowPos(g_mainGlfw, &mwx, &mwy);
+					glfwGetWindowSize(g_mainGlfw, &mww, &mwh);
+					mx = (float)(gx - mwx); my = (float)(gy - mwy);
+					overMain = mx >= 0 && my >= 0 && mx < (float)mww && my < (float)mwh;
+					overTarget = overMain && g_dockTargetValid &&
+					             mx >= g_dockTarget[0] && my >= g_dockTarget[1] &&
+					             mx <  g_dockTarget[0] + g_dockTarget[2] &&
+					             my <  g_dockTarget[1] + g_dockTarget[3];
+				}
+				h->dragging = false;
+				g_hostDragOverMain = false;
+				glfwSetWindowOpacity(h->win, 1.0f);
+				if (overTarget) { h->dockDrop = true; h->dropX = mx; h->dropY = my; }
+			}
+			else
+			{
+				int gx = 0, gy = 0;
+				HostCursorGlobal(h->win, gx, gy);
+				glfwSetWindowPos(h->win, gx - (int)h->hotX, gy - (int)h->hotY);
+				bool overMain = false, overTarget = false;
+				if (g_mainGlfw && !glfwGetWindowAttrib(g_mainGlfw, GLFW_ICONIFIED))
+				{
+					int mwx = 0, mwy = 0, mww = 0, mwh = 0;
+					glfwGetWindowPos(g_mainGlfw, &mwx, &mwy);
+					glfwGetWindowSize(g_mainGlfw, &mww, &mwh);
+					const float mx = (float)(gx - mwx), my = (float)(gy - mwy);
+					overMain = mx >= 0 && my >= 0 && mx < (float)mww && my < (float)mwh;
+					overTarget = overMain && g_dockTargetValid &&
+					             mx >= g_dockTarget[0] && my >= g_dockTarget[1] &&
+					             mx <  g_dockTarget[0] + g_dockTarget[2] &&
+					             my <  g_dockTarget[1] + g_dockTarget[3];
+				}
+				g_hostDragOverMain = overMain;
+				glfwSetWindowOpacity(h->win, overTarget ? 0.45f : 0.85f);   // "will dock" hint
+			}
+		}
 #endif
 
 		int fw = 0, fh = 0;
@@ -729,8 +931,9 @@ static void TickHosts()
 				NukeUI::HostBeginDrag(h, m.x, m.y);
 			}
 		}
-#ifdef _WIN32
-		// Borderless resize: the 6px edges belong to the frame (left/top edges also move the window).
+		// Borderless resize: the 6px edges belong to the frame (left/top edges also move the
+		// window). Cursor math is portable (GLFW screen space); only the raw cursor read and
+		// the capture-loss safety check are per-platform.
 		if (!h->dragging)
 		{
 			static GLFWcursor* curEW   = glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);
@@ -754,7 +957,13 @@ static void TickHosts()
 						h->rsEdge = e;
 						glfwGetWindowSize(h->win, &h->rsStartW, &h->rsStartH);
 						glfwGetWindowPos(h->win, &h->rsStartX, &h->rsStartY);
+#ifdef _WIN32
 						GetCursorPos(&h->rsCur);
+#else
+						int gx = 0, gy = 0;
+						HostCursorGlobal(h->win, gx, gy);
+						h->rsCur.x = gx; h->rsCur.y = gy;
+#endif
 						ImGui::ClearActiveID();   // the frame owns this gesture, not a widget
 					}
 				}
@@ -762,8 +971,14 @@ static void TickHosts()
 			}
 			else
 			{
+#ifdef _WIN32
 				POINT cp; GetCursorPos(&cp);
-				const int dx = cp.x - h->rsCur.x, dy = cp.y - h->rsCur.y;
+				const int dx = cp.x - (int)h->rsCur.x, dy = cp.y - (int)h->rsCur.y;
+#else
+				int cgx = 0, cgy = 0;
+				HostCursorGlobal(h->win, cgx, cgy);   // the resize button was pressed on the host
+				const int dx = cgx - (int)h->rsCur.x, dy = cgy - (int)h->rsCur.y;
+#endif
 				int nw = h->rsStartW, nh = h->rsStartH, nx = h->rsStartX, ny = h->rsStartY;
 				if (h->rsEdge & 2) nw += dx;
 				if (h->rsEdge & 1) { nw -= dx; nx += dx; }
@@ -773,14 +988,18 @@ static void TickHosts()
 				if (nh < 140) { if (h->rsEdge & 4) ny -= 140 - nh; nh = 140; }
 				glfwSetWindowPos(h->win, nx, ny);
 				glfwSetWindowSize(h->win, nw, nh);
-				if (!hio.MouseDown[0] && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+#ifdef _WIN32
+				const bool rsHeld = hio.MouseDown[0] || (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+#else
+				const bool rsHeld = HostMouseLeftDown(h->win, nullptr);   // absolute on macOS
+#endif
+				if (!rsHeld)
 				{
 					h->rsEdge = 0;
 					glfwSetCursor(h->win, nullptr);
 				}
 			}
 		}
-#endif
 		ImGui::Render();
 
 		ImDrawData* dd = ImGui::GetDrawData();
@@ -1023,6 +1242,7 @@ void NukeUI::Init(iRender* renderer)
 	// Either way imgui_impl_glfw mounts on the renderer's window: InitForOther(true) CHAINS its callbacks.
 	if (GLFWwindow* mainWin = (GLFWwindow*)renderer->nativeWindow())
 	{
+		g_mainGlfw = mainWin;   // portable host math (drag-to-dock in GLFW screen space)
 		if (g_nativeViewports)
 		{
 			io.ConfigFlags  |= ImGuiConfigFlags_ViewportsEnable;
@@ -1046,6 +1266,19 @@ void NukeUI::Init(iRender* renderer)
 		// With multi-viewport off Platform_CreateWindow is null — never wrap a null original.
 		g_origCreateWindow = pio.Platform_CreateWindow;
 		if (g_origCreateWindow) pio.Platform_CreateWindow = CreateWindowWithIcon;
+#else
+		// SELF-VERIFYING window placement: on macOS the GLFW 3.5 set/get pair disagreed on Y
+		// for borderless viewport windows (set lands flipped; imgui pos 637 -> OS pos 38,
+		// same X). imgui then walks the window a step per sync. Wrap the setter: place,
+		// read back, and if the OS answered off-target, solve actual = a*set + b per axis
+		// from two samples and hit exactly on the third call. An honest GLFW short-circuits
+		// at the first check.
+		g_origSetWindowPos = pio.Platform_SetWindowPos;
+		if (g_origSetWindowPos) pio.Platform_SetWindowPos = SetWindowPosVerified;
+		g_origShowWindow = pio.Platform_ShowWindow;
+		if (g_origShowWindow) pio.Platform_ShowWindow = ShowWindowVerified;
+		g_origSetWindowSize = pio.Platform_SetWindowSize;
+		if (g_origSetWindowSize) pio.Platform_SetWindowSize = SetWindowSizePosLocked;
 #endif
 	}
 	else
