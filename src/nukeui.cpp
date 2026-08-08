@@ -21,6 +21,12 @@
 #else
 #include <GLFW/glfw3.h>       // window/input plumbing is GLFW on every platform
 struct POINT { long x = 0, y = 0; };   // NukeUIHost::rsCur — only fed by the Windows chrome path
+#if !defined(__APPLE__)
+// nukeui_x11.cpp — Xlib.h's macro pollution (#define Status int, ...) stays out of this TU.
+extern "C" void* NukeUIX11WindowHandle(GLFWwindow* w);   // X11 Window id / wl_surface*
+extern "C" void  NukeUIX11CopyIcon(GLFWwindow* src, GLFWwindow* dst);   // _NET_WM_ICON mirror
+extern "C" bool  NukeUINativeIsWayland(void);
+#endif
 #endif
 
 struct GLFWwindow;
@@ -28,12 +34,26 @@ struct GLFWwindow;
 using namespace nuke;   // iRender / NukeUIDrawData live in namespace nuke
 
 static iRender*                            g_render = nullptr;
+
+// The renderer keys secondary swap chains on a NATIVE handle. imgui_impl_glfw fills
+// PlatformHandleRaw on Win32 (HWND) and Cocoa (NSWindow) but leaves it null on X11 —
+// resolve the X11 Window id from the viewport's GLFWwindow there.
+static void* ViewportNativeHandle(ImGuiViewport* v)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+	return v ? v->PlatformHandleRaw : nullptr;
+#else
+	return (v && v->PlatformHandle)
+	     ? NukeUIX11WindowHandle((GLFWwindow*)v->PlatformHandle) : nullptr;
+#endif
+}
 static std::vector<std::function<void()>>  g_callbacks;
+static void TickContentScale();   // per-frame DPI watch (defined with the UI-scale block)
 static bool                                g_glfwPlatform = false;   // imgui_impl_glfw mounted (viewports on)
 static void*                               g_mainHwnd = nullptr;     // main window (icon source for secondaries)
 static void (*g_origCreateWindow)(ImGuiViewport*) = nullptr;
 
-#ifndef _WIN32
+#ifdef __APPLE__
 static void (*g_origSetWindowPos)(ImGuiViewport*, ImVec2) = nullptr;
 
 // Place-verify-correct window positioning (see the install site for the macOS rationale).
@@ -92,6 +112,7 @@ static void ShowWindowVerified(ImGuiViewport* v)
 #endif
 
 // Platform-backend window creation wrapper: a new secondary OS window inherits the main window's icons.
+static GLFWwindow* g_mainGlfwIcon = nullptr;   // main window (X11 _NET_WM_ICON source)
 static void CreateWindowWithIcon(ImGuiViewport* v)
 {
 	if (g_origCreateWindow) g_origCreateWindow(v);
@@ -106,6 +127,9 @@ static void CreateWindowWithIcon(ImGuiViewport* v)
 		if (big) SendMessageW(dst, WM_SETICON, ICON_BIG,   (LPARAM)big);
 		if (sml) SendMessageW(dst, WM_SETICON, ICON_SMALL, (LPARAM)sml);
 	}
+#elif !defined(__APPLE__)
+	if (v->PlatformHandle && g_mainGlfwIcon)
+		NukeUIX11CopyIcon(g_mainGlfwIcon, (GLFWwindow*)v->PlatformHandle);
 #endif
 }
 
@@ -259,6 +283,7 @@ void NukeUI::Frame()
 	if (!g_render)
 		return;
 
+	TickContentScale();   // window moved to a different-DPI monitor -> rescale the UI
 	DocFrameBegin();   // stamp the frame for the detachable-document GC
 	ImGuiIO& io = ImGui::GetIO();
 	if (g_glfwPlatform)
@@ -317,7 +342,7 @@ void NukeUI::Frame()
 	if (g_glfwPlatform && (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable))
 	{
 		ImGui::UpdatePlatformWindows();
-#ifndef _WIN32
+#ifdef __APPLE__
 		// Position coherence: hitboxes live at imgui's viewport Pos, pixels at the OS window.
 		// Diverged (AppKit constraints, GLFW quirks) → adopt the OS position ONE-WAY via
 		// PlatformRequestMove. Never re-assert in a loop: an async mover turns that into a
@@ -351,7 +376,7 @@ void NukeUI::Frame()
 			BuildDrawData(v->DrawData, vpLists, vpCmds, vd);
 			const int vw = (int)(v->DrawData->DisplaySize.x * v->DrawData->FramebufferScale.x);
 			const int vh = (int)(v->DrawData->DisplaySize.y * v->DrawData->FramebufferScale.y);
-			g_render->uiViewportRender(v->PlatformHandleRaw, vw, vh, vd);
+			g_render->uiViewportRender(ViewportNativeHandle(v), vw, vh, vd);
 		}
 	}
 
@@ -466,6 +491,76 @@ static bool  g_dockTargetValid = false;
 void NukeUI::EnableNativeViewports(bool on) { g_nativeViewports = on; }
 bool NukeUI::NativeViewportsActive()        { return g_nativeViewports; }
 
+// ---- UI scale ------------------------------------------------------------------------------
+static ImGuiStyle g_uiStyleBase;          // the theme at 100%, captured after ApplyStyle
+static bool       g_uiStyleBaseValid = false;
+static float      g_uiScale = 1.0f;
+
+void NukeUI::CaptureStyleBaseline()
+{
+	if (!ImGui::GetCurrentContext()) return;
+	g_uiStyleBase      = ImGui::GetStyle();
+	g_uiStyleBaseValid = true;
+}
+
+void NukeUI::SetUIScale(float factor)
+{
+	if (!ImGui::GetCurrentContext()) return;
+	if (factor < 0.25f) factor = 0.25f;
+	if (factor > 4.0f)  factor = 4.0f;
+	if (!g_uiStyleBaseValid) CaptureStyleBaseline();
+	g_uiScale = factor;
+	// Sizes re-derive from the baseline (repeat calls never compound); the font stack scales
+	// through FontScaleMain — imgui 1.92 dynamic fonts re-rasterize crisply, icons included.
+	ImGuiStyle scaled = g_uiStyleBase;
+	scaled.ScaleAllSizes(factor);
+	scaled.FontScaleMain = factor;
+	ImGui::GetStyle() = scaled;
+	// Open host windows carry their own context with a style COPY — keep them in step
+	// (freshly created hosts snapshot the main style and inherit the scale for free).
+	ImGuiContext* mainCtx = ImGui::GetCurrentContext();
+	for (NukeUIHost* h : g_hosts)
+		if (h && h->ctx)
+		{
+			ImGui::SetCurrentContext(h->ctx);
+			ImGui::GetStyle() = scaled;
+			ImGui::SetCurrentContext(mainCtx);
+		}
+}
+
+float NukeUI::SystemContentScale()
+{
+	float sx = 1.0f, sy = 1.0f;
+	if (g_mainGlfw) glfwGetWindowContentScale(g_mainGlfw, &sx, &sy);
+	return sx > 0.1f ? sx : 1.0f;
+}
+
+// User factor (Preferences slider) with LIVE content-scale tracking: Frame() polls the OS
+// scale — one glfw call — and re-applies when the window lands on a different-DPI monitor.
+static float g_userUIScale        = 0.0f;   // 0 = tracking inactive (raw SetUIScale only)
+static float g_lastContentScale   = 1.0f;
+
+void NukeUI::SetUserUIScale(float userFactor)
+{
+	if (userFactor <= 0.0f) userFactor = 1.0f;
+	g_userUIScale      = userFactor;
+	g_lastContentScale = SystemContentScale();
+	SetUIScale(g_userUIScale * g_lastContentScale);
+}
+
+static void TickContentScale()
+{
+	if (g_userUIScale <= 0.0f || !g_mainGlfw) return;
+	const float cs = NukeUI::SystemContentScale();
+	if (cs > 0.1f && (cs > g_lastContentScale * 1.01f || cs < g_lastContentScale * 0.99f))
+	{
+		printf("[NukeUI]\t\tmonitor content scale %.2f -> %.2f — rescaling UI\n",
+		       g_lastContentScale, cs);
+		g_lastContentScale = cs;
+		NukeUI::SetUIScale(g_userUIScale * cs);
+	}
+}
+
 bool NukeUI::HostDragActive() { return g_hostDragOverMain; }
 void NukeUI::SetDockTarget(float x, float y, float w, float h)
 {
@@ -521,6 +616,16 @@ void* NukeUI::HostCreate(const char* title, int w, int h)
 	glfwWindowHint(GLFW_VISIBLE,   GLFW_TRUE);
 	GLFWwindow* win = glfwCreateWindow(w, h, title ? title : "NukeEngine", nullptr, nullptr);
 	if (!win) return nullptr;
+	// Spawn CENTERED over the main window — the WM's default placement can land a fresh
+	// host almost off-screen. A tear-off re-positions under the cursor this same frame;
+	// on native Wayland this is a no-op and the compositor's own placement applies.
+	if (g_mainGlfw)
+	{
+		int mx = 0, my = 0, mw = 0, mh = 0;
+		glfwGetWindowPos(g_mainGlfw, &mx, &my);
+		glfwGetWindowSize(g_mainGlfw, &mw, &mh);
+		glfwSetWindowPos(win, mx + (mw - w) / 2, my + (mh - h) / 2);
+	}
 
 	NukeUIHost* host = new NukeUIHost();
 	host->win = win;
@@ -559,6 +664,10 @@ void* NukeUI::HostCreate(const char* title, int w, int h)
 		if (big) SendMessageW(dst, WM_SETICON, ICON_BIG,   (LPARAM)big);
 		if (sml) SendMessageW(dst, WM_SETICON, ICON_SMALL, (LPARAM)sml);
 	}
+#elif !defined(__APPLE__)
+	// Inherit the editor's window icon (X11 _NET_WM_ICON, set by the renderer on the main window).
+	if (g_mainGlfw)
+		NukeUIX11CopyIcon(g_mainGlfw, win);
 #endif
 	g_hosts.push_back(host);
 	return host;
@@ -596,8 +705,10 @@ void NukeUI::WindowCaptionButtons(void* hostPtr)
 	if (hostPtr) os = ((NukeUIHost*)hostPtr)->win;
 	else if (vp && vp != ImGui::GetMainViewport() && (vp->Flags & ImGuiViewportFlags_IsPlatformWindow))
 		os = (GLFWwindow*)vp->PlatformHandle;
-	// No OS window of its own (the window still lives inside the main one): maximize/restore
-	// still work — they stretch the imgui window over its viewport — only minimize needs one.
+	// Caption buttons belong to windows with an OS window OF THEIR OWN. A docked tab or a
+	// floating panel inside the main window keeps imgui's plain close X and nothing else —
+	// custom minimize/maximize chrome there is noise (and overlaps the tab strip when docked).
+	if (!os || win->DockIsActive) return;
 	const bool canMinimize = os != nullptr;
 
 	// Maximize state. An imgui-OWNED window must NOT be maximized through the OS: imgui pushes
@@ -662,6 +773,42 @@ void NukeUI::WindowCaptionButtons(void* hostPtr)
 	dl->PushClipRect(ImVec2(win->Pos.x, y0), ImVec2(win->Pos.x + win->Size.x, y1), false);
 	struct ClipPop { ImDrawList* d; ~ClipPop() { d->PopClipRect(); } } clipPop{ dl };
 	bool overBtn = false;
+	// Native Wayland: drag-to-dock cannot exist (no global cursor, no window positioning) —
+	// a torn-off window's ONLY way home is this explicit re-dock button, one slot left of
+	// minimize. X11/Windows/macOS keep the drag gesture and skip the extra button.
+	bool showDock = false;
+#if !defined(_WIN32) && !defined(__APPLE__)
+	showDock = hostPtr && NukeUINativeIsWayland();
+#endif
+	if (showDock)
+	{
+		const float x1 = win->Pos.x + win->Size.x - slotW * 4 + 2.0f;
+		const float x2 = x1 + slotW - 4.0f;
+		const bool over = mp.x >= x1 && mp.x < x2 && mp.y >= y0 && mp.y < y1;
+		overBtn = overBtn || over;
+		if (over)
+			dl->AddRectFilled(ImVec2(x1, y0 + 1), ImVec2(x2, y1 - 1),
+			                  ImGui::GetColorU32(ImGuiCol_ButtonHovered), 3.0f);
+		const ImU32 gc = ImGui::GetColorU32(over ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+		const float cx = (x1 + x2) * 0.5f, cy = (y0 + y1) * 0.5f;
+		// dock-back glyph: a frame with an arrow pointing into it
+		dl->AddRect(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), gc, 0, 0, 1.5f);
+		dl->AddLine(ImVec2(cx + 4, cy - 4), ImVec2(cx - 2, cy + 2), gc, 1.5f);
+		dl->AddLine(ImVec2(cx - 2, cy - 1), ImVec2(cx - 2, cy + 2), gc, 1.5f);
+		dl->AddLine(ImVec2(cx - 2, cy + 2), ImVec2(cx + 1, cy + 2), gc, 1.5f);
+		if (over && ImGui::IsMouseClicked(0))
+		{
+			ImGui::ClearActiveID();
+			g.MovingWindow = nullptr;
+			NukeUIHost* h = (NukeUIHost*)hostPtr;
+			h->dragging = false;
+			h->dockDrop = true;   // consumed by HostDockDrop -> the regular re-dock flow
+			if (g_dockTargetValid)
+			{ h->dropX = g_dockTarget[0] + g_dockTarget[2] * 0.5f; h->dropY = g_dockTarget[1] + g_dockTarget[3] * 0.5f; }
+			else if (g_mainGlfw)
+			{ int mw = 0, mh = 0; glfwGetWindowSize(g_mainGlfw, &mw, &mh); h->dropX = mw * 0.5f; h->dropY = mh * 0.5f; }
+		}
+	}
 	// slot 0 = minimize, slot 1 = maximize/restore; imgui's close X owns the rightmost slot.
 	// Without an OS window of its own there is nothing to iconify — start at the maximize slot.
 	for (int slot = canMinimize ? 0 : 1; slot < 2; ++slot)
@@ -695,7 +842,7 @@ void NukeUI::WindowCaptionButtons(void* hostPtr)
 	}
 	// double-click on the free title area = maximize toggle (Windows convention, never a roll-up)
 	if (!overBtn && mp.y >= y0 && mp.y < y1
-	    && mp.x >= win->Pos.x && mp.x < win->Pos.x + win->Size.x - slotW * 3
+	    && mp.x >= win->Pos.x && mp.x < win->Pos.x + win->Size.x - slotW * (showDock ? 4 : 3)
 	    && ImGui::IsMouseDoubleClicked(0))
 	{
 		ImGui::ClearActiveID();
@@ -732,6 +879,11 @@ void NukeUI::HostBeginDrag(void* hostPtr, float hotX, float hotY)
 		HostCursorGlobal(g_mainGlfw, gx, gy);
 		glfwSetWindowPos(h->win, gx - (int)hotX, gy - (int)hotY);
 	}
+	// The click that started the gesture landed on the MAIN window, so the WM's focus-
+	// stealing prevention ignores a plain raise for this one — ride ABOVE (always-on-top)
+	// for the drag's duration instead; the drop site clears it. Exactly the Windows feel:
+	// the dragged window is never under anything.
+	glfwSetWindowAttrib(h->win, GLFW_FLOATING, GLFW_TRUE);
 #endif
 	glfwFocusWindow(h->win);
 }
@@ -783,6 +935,8 @@ void NukeUI::HostDestroy(void* hostPtr)
 	{
 #ifdef _WIN32
 		g_render->uiViewportDestroy((void*)glfwGetWin32Window(h->win));   // park its swap chain
+#elif !defined(__APPLE__)
+		g_render->uiViewportDestroy(NukeUIX11WindowHandle(h->win));
 #endif
 		glfwDestroyWindow(h->win);
 	}
@@ -866,6 +1020,7 @@ static void TickHosts()
 				h->dragging = false;
 				g_hostDragOverMain = false;
 				glfwSetWindowOpacity(h->win, 1.0f);
+				glfwSetWindowAttrib(h->win, GLFW_FLOATING, GLFW_FALSE);   // drop the drag-time always-on-top
 				if (overTarget) { h->dockDrop = true; h->dropX = mx; h->dropY = my; }
 			}
 			else
@@ -892,13 +1047,20 @@ static void TickHosts()
 		}
 #endif
 
-		int fw = 0, fh = 0;
+		int fw = 0, fh = 0, ww = 0, wh = 0;
 		glfwGetFramebufferSize(h->win, &fw, &fh);
+		glfwGetWindowSize(h->win, &ww, &wh);
 		if (fw < 8 || fh < 8) continue;   // minimized: sit the frame out
+		if (ww < 1 || wh < 1) { ww = fw; wh = fh; }
 
 		ImGui::SetCurrentContext(h->ctx);
 		ImGuiIO& hio = ImGui::GetIO();
-		hio.DisplaySize = ImVec2((float)fw, (float)fh);
+		// LOGICAL size for imgui — the cursor callbacks speak logical coordinates. On a scaled
+		// native-Wayland monitor the framebuffer is logical×scale; feeding pixels here put
+		// every hitbox at 1/scale of its visual position (title bar unclickable, everything
+		// offset). BuildDrawData scales geometry/clips back up via DisplayFramebufferScale.
+		hio.DisplaySize             = ImVec2((float)ww, (float)wh);
+		hio.DisplayFramebufferScale = ImVec2((float)fw / (float)ww, (float)fh / (float)wh);
 		hio.DeltaTime   = dt;
 		ImGui::NewFrame();
 		ImGui::SetNextWindowPos(ImVec2(0, 0));   // pinned: imgui never moves it INSIDE the host
@@ -1010,6 +1172,8 @@ static void TickHosts()
 			BuildDrawData(dd, hostLists, hostCmds, nd);
 #ifdef _WIN32
 			g_render->uiViewportRender((void*)glfwGetWin32Window(h->win), fw, fh, nd);
+#elif !defined(__APPLE__)
+			g_render->uiViewportRender(NukeUIX11WindowHandle(h->win), fw, fh, nd);
 #endif
 		}
 	}
@@ -1102,6 +1266,14 @@ static void DocWindowImpl(const char* id, const char* title, bool* p_open,
 		// Native viewports: imgui owns the whole lifecycle — hosts and gestures stay dormant.
 		if (d.wantDock)  { d.detached = false; d.wantDock = false; }
 		if (d.wantFocus) { ImGui::SetNextWindowFocus(); d.wantFocus = false; }
+		// First appearance: dead CENTER of the main window. imgui's default placement can
+		// land a fresh window at the far edge of the viewport — sometimes practically
+		// off-screen. imgui.ini-restored positions still win (FirstUseEver).
+		{
+			ImGuiViewport* mv = ImGui::GetMainViewport();
+			ImGui::SetNextWindowPos(ImVec2(mv->Pos.x + mv->Size.x * 0.5f, mv->Pos.y + mv->Size.y * 0.5f),
+			                        ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+		}
 		ImGui::SetNextWindowSize(ImVec2((float)d.w, (float)d.h), ImGuiCond_FirstUseEver);
 		// NoCollapse: the title double-click maximizes (WindowCaptionButtons) instead of
 		// rolling the window up — imgui consumes that double-click inside Begin otherwise.
@@ -1243,6 +1415,17 @@ void NukeUI::Init(iRender* renderer)
 	if (GLFWwindow* mainWin = (GLFWwindow*)renderer->nativeWindow())
 	{
 		g_mainGlfw = mainWin;   // portable host math (drag-to-dock in GLFW screen space)
+#if !defined(_WIN32) && !defined(__APPLE__)
+		// Native Wayland has no global coordinates and no client-side window positioning —
+		// imgui multi-viewport would place windows blind and fight the compositor. Panels
+		// stay docked in the main window; NUKE_DISPLAY_BACKEND=x11 restores tear-off.
+		if (g_nativeViewports && NukeUINativeIsWayland())
+		{
+			printf("[NukeUI]\t\tnative Wayland: imgui multi-viewport OFF (no window positioning) — "
+			       "run with NUKE_DISPLAY_BACKEND=x11 for detachable panels\n");
+			g_nativeViewports = false;
+		}
+#endif
 		if (g_nativeViewports)
 		{
 			io.ConfigFlags  |= ImGuiConfigFlags_ViewportsEnable;
@@ -1257,22 +1440,27 @@ void NukeUI::Init(iRender* renderer)
 		// The renderer owns one swap chain per secondary window — drop it with the window.
 		pio.Renderer_DestroyWindow = [](ImGuiViewport* v)
 		{
-			if (g_render && v->PlatformHandleRaw)
-				g_render->uiViewportDestroy(v->PlatformHandleRaw);
+			void* nh = ViewportNativeHandle(v);
+			if (g_render && nh)
+				g_render->uiViewportDestroy(nh);
 		};
 #ifdef _WIN32
 		// Secondary windows inherit the main window's icons (title bar + taskbar).
 		g_mainHwnd = (void*)glfwGetWin32Window(mainWin);
+#elif !defined(__APPLE__)
+		g_mainGlfwIcon = mainWin;   // X11: _NET_WM_ICON source for secondary windows
+#endif
 		// With multi-viewport off Platform_CreateWindow is null — never wrap a null original.
 		g_origCreateWindow = pio.Platform_CreateWindow;
 		if (g_origCreateWindow) pio.Platform_CreateWindow = CreateWindowWithIcon;
-#else
+#ifdef __APPLE__
 		// SELF-VERIFYING window placement: on macOS the GLFW 3.5 set/get pair disagreed on Y
 		// for borderless viewport windows (set lands flipped; imgui pos 637 -> OS pos 38,
 		// same X). imgui then walks the window a step per sync. Wrap the setter: place,
 		// read back, and if the OS answered off-target, solve actual = a*set + b per axis
 		// from two samples and hit exactly on the third call. An honest GLFW short-circuits
-		// at the first check.
+		// at the first check. macOS-ONLY: on X11/Wayland these extra set/get round-trips are
+		// pure noise (and Wayland can't position windows at all).
 		g_origSetWindowPos = pio.Platform_SetWindowPos;
 		if (g_origSetWindowPos) pio.Platform_SetWindowPos = SetWindowPosVerified;
 		g_origShowWindow = pio.Platform_ShowWindow;

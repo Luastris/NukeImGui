@@ -21,6 +21,20 @@ namespace NukeUI
 	NUKEUI_API void EnableNativeViewports(bool on);
 	NUKEUI_API bool NativeViewportsActive();
 
+	// ---- UI scale ------------------------------------------------------------------------
+	// CaptureStyleBaseline remembers the CURRENT style as "100%" (call it right after the
+	// theme is applied); SetUIScale re-derives every size from that baseline and scales the
+	// font stack (crisp — imgui 1.92 dynamic fonts, no atlas rebake). Open host windows and
+	// later-created ones pick the scale up automatically. SystemContentScale is the OS's
+	// scale for the main window's monitor (Retina/HiDPI), 1.0 when unknown — multiply the
+	// user's percentage by it for a display-independent result.
+	NUKEUI_API void  CaptureStyleBaseline();
+	NUKEUI_API void  SetUIScale(float factor);      // RAW: 1.0 = the captured baseline
+	NUKEUI_API float SystemContentScale();
+	// The editor-facing entry: effective = userFactor × SystemContentScale(), tracked LIVE —
+	// dragging the window to a monitor with another scale re-applies automatically.
+	NUKEUI_API void  SetUserUIScale(float userFactor);
+
 	// Create the ImGui context and hook this UI into the renderer's per-frame
 	// GUI callback. Call once after the renderer is initialized.
 	NUKEUI_API void Init(nuke::iRender* renderer);

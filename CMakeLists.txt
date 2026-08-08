@@ -24,6 +24,7 @@ add_library(NukeImGui SHARED
     ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp   # multi-viewport PLATFORM backend (native OS windows)
     imguizmo/ImGuizmo.cpp   # transform gizmo (compiled against OUR imgui, shares the context)
     src/nukeui.cpp          # the bridge: ImGui <-> iRender neutral seam
+    src/nukeui_x11.cpp      # Linux: X11 native-handle shim — compiles empty elsewhere
 )
 
 # GLFW (vcpkg, DYNAMIC -- the same glfw3.dll the renderer loads, so both modules share
@@ -49,6 +50,11 @@ else()
         # Absolute cursor/button queries for host gestures (see nukeui_cocoa.mm).
         target_sources(NukeImGui PRIVATE src/nukeui_cocoa.mm)
         target_link_libraries(NukeImGui PRIVATE "-framework AppKit" "-framework CoreGraphics")
+    else()
+        # nukeui_x11.cpp calls Xlib directly (_NET_WM_ICON mirroring) — its own link, not
+        # a ride on GLFW's transitive one.
+        find_package(X11 REQUIRED)
+        target_link_libraries(NukeImGui PRIVATE X11::X11)
     endif()
     target_compile_options(NukeImGui PRIVATE -Wno-c++11-narrowing -Wno-unknown-attributes)
     set_target_properties(NukeImGui PROPERTIES BUILD_RPATH "${_nuke_ig_rpath}")
