@@ -54,6 +54,10 @@ namespace NukeUI
 	// as their ranges do not overlap. Call AFTER the app adds its main font, BEFORE the first frame.
 	NUKEUI_API void MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY = 0.0f,
 	                              unsigned int rangeMin = 0, unsigned int rangeMax = 0);
+	// Merge a FALLBACK text font (CJK / Arabic / ... coverage) behind the main font: a glyph the
+	// fonts before it lack is taken from this one (imgui 1.92 loads glyphs on demand, no ranges).
+	// Call in chain order after the main font, before the first frame. sizePx 0 = inherit.
+	NUKEUI_API void MergeFallbackFont(const char* ttfPath, float sizePx);
 
 	// Host windows: a decorated OS window drawn through its OWN ImGui context (shared
 	// font atlas). Hosts tick inside Frame() after the main context.

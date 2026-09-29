@@ -7,6 +7,7 @@
 #include "backends/imgui_impl_glfw.h"   // multi-viewport PLATFORM backend (native OS windows)
 #include <render/irender.h>   // engine: iRender + NukeUIDrawData (neutral seam)
 #include <vector>
+#include <cstring>
 #include <chrono>
 #include <map>
 #ifdef _WIN32
@@ -267,6 +268,15 @@ void NukeUI::MergeIconFont(const char* ttfPath, float sizePx, float glyphOffsetY
 	cfg.GlyphMinAdvanceX = sizePx;      // make icons monospaced so toolbar buttons align
 	cfg.GlyphOffset.y    = glyphOffsetY; // nudge icons down to vertically centre them in the line
 	io.Fonts->AddFontFromFileTTF(ttfPath, sizePx, &cfg, ranges);
+}
+
+void NukeUI::MergeFallbackFont(const char* ttfPath, float sizePx)
+{
+	ImGuiIO& io = ImGui::GetIO();
+	ImFontConfig cfg;
+	cfg.MergeMode  = true;
+	cfg.PixelSnapH = true;
+	io.Fonts->AddFontFromFileTTF(ttfPath, sizePx, &cfg);
 }
 
 void NukeUI::AddDrawCallback(const std::function<void()>& cb)
