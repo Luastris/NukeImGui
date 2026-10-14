@@ -1227,6 +1227,56 @@ void NukeUI::DocFocus(const char* id)
 	if (it != g_uiDocs.end()) it->second.wantFocus = true;
 }
 
+bool NukeUI::WarpCursor(void* imguiViewport, float screenX, float screenY)
+{
+	ImGuiViewport* vp = (ImGuiViewport*)imguiViewport;
+	GLFWwindow* wnd = vp ? (GLFWwindow*)vp->PlatformHandle : nullptr;
+	if (!wnd) return false;
+	glfwSetCursorPos(wnd, screenX - vp->Pos.x, screenY - vp->Pos.y);
+	ImGui::GetIO().AddMousePosEvent(screenX, screenY);
+	return true;
+}
+
+// ---- clipboard change tracking: the platform's counter + "is text offered" (shims below) ----
+#if defined(_WIN32)
+static unsigned ClipVersion() { return (unsigned)GetClipboardSequenceNumber(); }   // 0 only without clipboard access -> time-polled
+static bool     ClipHasText() { return IsClipboardFormatAvailable(CF_UNICODETEXT) || IsClipboardFormatAvailable(CF_TEXT); }
+#elif defined(__APPLE__)
+extern "C" unsigned NukeUICocoaClipboardVersion(void);
+extern "C" bool     NukeUICocoaClipboardHasText(void);
+static unsigned ClipVersion() { return NukeUICocoaClipboardVersion(); }
+static bool     ClipHasText() { return NukeUICocoaClipboardHasText(); }
+#else
+extern "C" unsigned NukeUIX11ClipboardVersion(void);               // 0 = no counter (Wayland / no XFixes)
+extern "C" bool     NukeUIX11ClipboardHasText(GLFWwindow* main);
+static unsigned ClipVersion() { return NukeUIX11ClipboardVersion(); }
+static bool     ClipHasText() { return NukeUIX11ClipboardHasText(g_mainGlfw); }
+#endif
+
+const std::string& NukeUI::ClipboardText(bool* changed)
+{
+	static std::string cached;
+	static unsigned seen = ~0u;
+	static double lastPoll = -1.0;
+	bool fresh = false;
+	const unsigned v = ClipVersion();
+	if (v != 0) { if (v != seen) { seen = v; fresh = true; } }
+	else
+	{
+		const double t = ImGui::GetTime();   // no counter on this platform: at most twice a second
+		if (lastPoll < 0.0 || t - lastPoll >= 0.5) { lastPoll = t; fresh = true; }
+	}
+	if (fresh)
+	{
+		std::string now;
+		if (ClipHasText()) { const char* s = ImGui::GetClipboardText(); if (s) now = s; }
+		fresh = (now != cached);
+		cached.swap(now);
+	}
+	if (changed) *changed = fresh;
+	return cached;
+}
+
 void NukeUI::DocDetachAll(bool detached)
 {
 	for (auto& kv : g_uiDocs)

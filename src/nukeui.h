@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <string>
 
 #ifdef _WIN32
   #ifdef NUKEIMGUI_EXPORTS
@@ -103,4 +104,14 @@ namespace NukeUI
 	NUKEUI_API bool DocDetached(const char* id);     // currently an OS window?
 	NUKEUI_API void DocDetachDefault(bool detached); // mode for NEW documents (editor preference)
 	NUKEUI_API void DocDetachAll(bool detached);     // apply a mode to every open document NOW
+	// Move the OS cursor to `screen` (imgui screen coords) inside that imgui viewport's window
+	// and feed imgui the new position (look / pan edge wrap). False where the viewport has no
+	// platform window (GDI-blit fallback hosts). The window layer stays here, never in the editor.
+	NUKEUI_API bool WarpCursor(void* imguiViewport, float screenX, float screenY);   // ImGuiViewport*
+	// The OS clipboard for per-frame pollers (menus, Paste buttons): the current text ("" when it
+	// holds none) and whether it changed since the previous call. The OS is read only when its
+	// change counter moved - Windows clipboard sequence number, macOS pasteboard changeCount, X11
+	// XFixes selection-owner events - and only when text is offered; a platform without a counter
+	// (Wayland) re-reads at most twice a second. Never a per-frame conversion request.
+	NUKEUI_API const std::string& ClipboardText(bool* changed = nullptr);
 }

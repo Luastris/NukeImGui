@@ -27,4 +27,18 @@ extern "C" bool NukeUICocoaMouseLeftDown(void)
     return ([NSEvent pressedMouseButtons] & 1) != 0;
 }
 
+// Clipboard change tracking (NukeUI::ClipboardText): the general pasteboard's changeCount
+// (+1 keeps it off the "no counter" 0), and whether a string type is on it.
+extern "C" unsigned NukeUICocoaClipboardVersion(void)
+{
+    @autoreleasepool { return (unsigned)[[NSPasteboard generalPasteboard] changeCount] + 1u; }
+}
+extern "C" bool NukeUICocoaClipboardHasText(void)
+{
+    @autoreleasepool
+    {
+        return [[NSPasteboard generalPasteboard] availableTypeFromArray:@[NSPasteboardTypeString]] != nil;
+    }
+}
+
 #endif // __APPLE__

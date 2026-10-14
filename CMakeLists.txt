@@ -54,7 +54,7 @@ else()
         # nukeui_x11.cpp calls Xlib directly (_NET_WM_ICON mirroring) — its own link, not
         # a ride on GLFW's transitive one.
         find_package(X11 REQUIRED)
-        target_link_libraries(NukeImGui PRIVATE X11::X11)
+        target_link_libraries(NukeImGui PRIVATE X11::X11 X11::Xfixes)   # Xfixes: clipboard owner-change events
     endif()
     target_compile_options(NukeImGui PRIVATE -Wno-c++11-narrowing -Wno-unknown-attributes)
     set_target_properties(NukeImGui PROPERTIES BUILD_RPATH "${_nuke_ig_rpath}")
